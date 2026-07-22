@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "quiver-core",
+    "quiver-server",
+    "quiver-py",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/YOUR_USERNAME/quiver-db"
+description = "A portfolio-grade, single-node, embeddable vector search engine implementing HNSW and IVF-PQ from scratch"
+
+[workspace.dependencies]
+# Core dependencies
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+memmap2 = "0.9"
+crc32fast = "1.4"
+byteorder = "1.5"
+thiserror = "2"
+rand = "0.9"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Serialization (for benchmark output, config)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Server (Phase 10)
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+
+# Python bindings (Phase 10)
+pyo3 = { version = "0.23", features = ["extension-module"] }

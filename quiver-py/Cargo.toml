@@ -1,0 +1,15 @@
+[package]
+name = "quiver-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for the Quiver vector search engine"
+
+[lib]
+name = "quiver_db"
+crate-type = ["cdylib"]
+
+[dependencies]
+quiver-core = { path = "../quiver-core" }
+pyo3 = { workspace = true }

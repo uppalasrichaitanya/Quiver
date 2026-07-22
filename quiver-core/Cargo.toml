@@ -1,0 +1,30 @@
+[package]
+name = "quiver-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core vector search engine library for Quiver — implements HNSW, IVF-PQ, storage, and distance metrics"
+
+[dependencies]
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+memmap2 = { workspace = true }
+crc32fast = { workspace = true }
+byteorder = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "distance_benchmarks"
+harness = false
+
+[[bench]]
+name = "index_benchmarks"
+harness = false
