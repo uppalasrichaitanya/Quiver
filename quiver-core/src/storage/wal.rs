@@ -122,14 +122,27 @@ impl Wal {
 
             // Try to read the entry length
             let entry_len = match reader.read_u32::<LittleEndian>() {
-                Ok(len) => len as usize,
+                Ok(len) => match usize::try_from(len) {
+                    Ok(len) => len,
+                    Err(_) => break,
+                },
                 Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             };
 
             // Check if there are enough bytes remaining
-            let bytes_needed = entry_len + 4; // entry body + checksum
-            if current_pos + 4 + bytes_needed as u64 > file_len {
+            let total_entry_len = match 4_usize
+                .checked_add(entry_len)
+                .and_then(|len| len.checked_add(4))
+            {
+                Some(len) => len,
+                None => break,
+            };
+            let entry_end = match current_pos.checked_add(total_entry_len as u64) {
+                Some(end) => end,
+                None => break,
+            };
+            if entry_end > file_len {
                 // Incomplete entry — truncate here
                 break;
             }
@@ -170,7 +183,7 @@ impl Wal {
             match Self::parse_entry_body(&body) {
                 Some(entry) => {
                     entries.push(entry);
-                    valid_up_to = current_pos + 4 + entry_len as u64 + 4;
+                    valid_up_to = entry_end;
                 }
                 None => break,
             }
@@ -425,5 +438,16 @@ mod tests {
         let (entries, _) = Wal::read_entries(&path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].vector_id, 1);
+    }
+
+    #[test]
+    fn test_wal_absurd_length_prefix_does_not_allocate_or_panic() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+        std::fs::write(&path, u32::MAX.to_le_bytes()).unwrap();
+
+        let (entries, valid_up_to) = Wal::read_entries(&path).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(valid_up_to, 0);
     }
 }

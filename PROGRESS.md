@@ -48,6 +48,9 @@ quiver/
 - **Durable Deletion** — delete records are fsynced before tombstones become visible and are restored on reopen
 - **Crash-safe compaction** — rewrites live vectors to a durable replacement, journals the data/WAL swap, and resets the WAL only after installation
 - **Stable IDs after compaction** — format v2 stores an explicit u64 vector ID per record; format v1 remains readable
+- **Validated file parser** — bounds-checks headers, record sizes, counts, offsets, and v2 IDs before mmap data is exposed
+- **File-format fuzz target** — dedicated `cargo fuzz` target covers raw/truncated data plus synthesized and mutated v1/v2 files
+- **Process-kill recovery** — hard-kill test proves a WAL-fsynced insert is recovered before its mmap write completes
 
 ### Phase 3: Distance Metrics
 - **Scalar:** L2 squared, dot product, cosine similarity
@@ -75,7 +78,7 @@ quiver/
 ### Phase 6: SIMD Distance Kernels (PARTIALLY COMPLETE)
 - ✅ AVX2+FMA kernels for L2, dot product, cosine
 - ✅ Runtime feature detection + scalar fallback
-- ✅ Correctness validated (75 tests pass, including durable deletion, kill-mid-compaction recovery, legacy-format migration, and non-aligned SIMD dimensions)
+- ✅ Correctness validated (82 tests pass, including malformed files, hard-kill WAL recovery, kill-mid-compaction recovery, legacy-format migration, and non-aligned SIMD dimensions)
 - ✅ Criterion benchmark harness (scalar vs SIMD, index-level)
 - ⬜ Run benchmarks and capture before/after numbers
 - ⬜ Document SIMD speedup results
@@ -83,7 +86,7 @@ quiver/
 ## 📊 Test Status
 
 ```
-test result: ok. 75 passed; 0 failed; 0 ignored
+test result: ok. 82 passed; 0 failed; 0 ignored
 ```
 
 All tests pass as of the last run:

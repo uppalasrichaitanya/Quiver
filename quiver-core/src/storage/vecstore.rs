@@ -18,10 +18,10 @@ use std::path::{Path, PathBuf};
 
 use crate::distance::Metric;
 use crate::error::{QuiverError, Result};
+use crate::storage::format::{parse_file_bytes, VECTOR_ID_SIZE};
 use crate::storage::header::{FileHeader, HEADER_SIZE, LEGACY_FORMAT_VERSION};
 use crate::storage::wal::{Wal, WalOp};
 
-const VECTOR_ID_SIZE: usize = std::mem::size_of::<u64>();
 const COMPACTION_PREPARED: &[u8] = b"prepared";
 const COMPACTION_OLD_MOVED: &[u8] = b"old_moved";
 const COMPACTION_INSTALLED: &[u8] = b"installed";
@@ -137,36 +137,26 @@ impl VectorStore {
             .write(true)
             .open(&data_path)?;
 
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-        let header = FileHeader::from_bytes(&mmap[..HEADER_SIZE])?;
-        let vector_bytes = header.dimension as usize * std::mem::size_of::<f32>();
-        let record_size = if header.version == LEGACY_FORMAT_VERSION {
-            vector_bytes
-        } else {
-            VECTOR_ID_SIZE + vector_bytes
-        };
+        let file_len = file.metadata()?.len();
+        if file_len < HEADER_SIZE as u64 {
+            return Err(QuiverError::InvalidFormat(format!(
+                "File too short: {file_len} bytes, expected at least {HEADER_SIZE}"
+            )));
+        }
 
-        let vector_ids = (0..header.vector_count as usize)
-            .map(|slot| {
-                if header.version == LEGACY_FORMAT_VERSION {
-                    slot as u64 + 1
-                } else {
-                    let offset = HEADER_SIZE + slot * record_size;
-                    u64::from_le_bytes(mmap[offset..offset + VECTOR_ID_SIZE].try_into().unwrap())
-                }
-            })
-            .collect();
+        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        let parsed = parse_file_bytes(&mmap)?;
 
         let mut store = Self {
             path: data_path,
             wal_path: wal_path_buf.clone(),
             mmap: Some(mmap),
             file: Some(file),
-            header,
+            header: parsed.header,
             wal: Some(Wal::open(&wal_path_buf)?),
-            record_size,
+            record_size: parsed.record_size,
             deleted_ids: HashSet::new(),
-            vector_ids,
+            vector_ids: parsed.vector_ids,
         };
 
         // Replay WAL. Insert replay is idempotent: IDs at or below the
@@ -219,6 +209,7 @@ impl VectorStore {
         let wal = self.wal.as_mut().expect("vector store WAL is open");
         wal.log_insert(vector_id, data)?;
         wal.flush()?;
+        ordinary_write_failpoint("wal_durable");
 
         // Then write to the main store
         self.insert_raw(vector_id, data)?;
@@ -591,6 +582,24 @@ fn compaction_failpoint(name: &str) {
 fn compaction_failpoint(_name: &str) {}
 
 #[cfg(test)]
+fn ordinary_write_failpoint(name: &str) {
+    if std::env::var("QUIVER_WRITE_FAILPOINT").as_deref() != Ok(name) {
+        return;
+    }
+
+    if let Ok(signal_path) = std::env::var("QUIVER_WRITE_SIGNAL") {
+        fs::write(signal_path, name).unwrap();
+    }
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(not(test))]
+fn ordinary_write_failpoint(_name: &str) {}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
@@ -603,6 +612,14 @@ mod tests {
         let wal_path = dir.path().join("vectors.wal");
         let store = VectorStore::create(data_path, wal_path, dim, Metric::L2).unwrap();
         (dir, store)
+    }
+
+    fn assert_invalid_open(data_path: &Path, wal_path: &Path) {
+        match VectorStore::open(data_path, wal_path) {
+            Err(QuiverError::InvalidFormat(_)) => {}
+            Err(error) => panic!("expected InvalidFormat, got {error:?}"),
+            Ok(_) => panic!("corrupted file unexpectedly opened"),
+        }
     }
 
     #[test]
@@ -651,6 +668,63 @@ mod tests {
         let (_dir, store) = setup(3);
         let result = store.get_vector(0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_zero_byte_file_returns_invalid_format() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("zero.qvdb");
+        let wal_path = dir.path().join("zero.wal");
+        File::create(&data_path).unwrap();
+        File::create(&wal_path).unwrap();
+
+        assert_invalid_open(&data_path, &wal_path);
+    }
+
+    #[test]
+    fn test_open_short_header_returns_invalid_format() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("short.qvdb");
+        let wal_path = dir.path().join("short.wal");
+        fs::write(&data_path, b"QVDB\x02").unwrap();
+        File::create(&wal_path).unwrap();
+
+        assert_invalid_open(&data_path, &wal_path);
+    }
+
+    #[test]
+    fn test_open_corrupted_header_field_returns_invalid_format() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("bad_dimension.qvdb");
+        let wal_path = dir.path().join("bad_dimension.wal");
+        let header = FileHeader::new(0, Metric::L2);
+        fs::write(&data_path, header.to_bytes()).unwrap();
+        File::create(&wal_path).unwrap();
+
+        assert_invalid_open(&data_path, &wal_path);
+    }
+
+    #[test]
+    fn test_open_truncated_final_record_returns_invalid_format_for_v1_and_v2() {
+        for version in [LEGACY_FORMAT_VERSION, crate::storage::header::FORMAT_VERSION] {
+            let dir = TempDir::new().unwrap();
+            let data_path = dir.path().join(format!("truncated_v{version}.qvdb"));
+            let wal_path = dir.path().join(format!("truncated_v{version}.wal"));
+            let mut header = FileHeader::new(2, Metric::L2);
+            header.version = version;
+            header.vector_count = 1;
+            header.max_vector_id = 1;
+
+            let mut bytes = header.to_bytes();
+            if version != LEGACY_FORMAT_VERSION {
+                bytes.extend_from_slice(&1_u64.to_le_bytes());
+            }
+            bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+            fs::write(&data_path, bytes).unwrap();
+            File::create(&wal_path).unwrap();
+
+            assert_invalid_open(&data_path, &wal_path);
+        }
     }
 
     #[test]
@@ -918,6 +992,70 @@ mod tests {
         assert_eq!(store.get_vector(0).unwrap(), &[1.0, 1.0]);
         assert_eq!(store.get_vector(1).unwrap(), &[3.0, 3.0]);
         assert_eq!(store.wal_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn ordinary_insert_kill_child() {
+        if std::env::var("QUIVER_WRITE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let data_path = PathBuf::from(std::env::var("QUIVER_WRITE_DATA").unwrap());
+        let wal_path = PathBuf::from(std::env::var("QUIVER_WRITE_WAL").unwrap());
+        let mut store = VectorStore::open(data_path, wal_path).unwrap();
+        store.insert(&[9.0, 10.0]).unwrap();
+    }
+
+    #[test]
+    fn test_process_kill_after_wal_fsync_recovers_complete_insert() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("kill_insert.qvdb");
+        let wal_path = dir.path().join("kill_insert.wal");
+        let signal_path = dir.path().join("write.signal");
+
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            store.insert(&[1.0, 2.0]).unwrap();
+            store.flush().unwrap();
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("storage::vecstore::tests::ordinary_insert_kill_child")
+            .arg("--nocapture")
+            .env("QUIVER_WRITE_CHILD", "1")
+            .env("QUIVER_WRITE_DATA", &data_path)
+            .env("QUIVER_WRITE_WAL", &wal_path)
+            .env("QUIVER_WRITE_FAILPOINT", "wal_durable")
+            .env("QUIVER_WRITE_SIGNAL", &signal_path)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !signal_path.exists() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("insert child exited before failpoint: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(signal_path.exists(), "write failpoint was not reached");
+
+        // `kill` is SIGKILL on Unix and TerminateProcess on Windows. The WAL
+        // record is already fsynced, but insert_raw has not modified the mmap.
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get_vector(0).unwrap(), &[1.0, 2.0]);
+        assert_eq!(store.get_vector(1).unwrap(), &[9.0, 10.0]);
+        assert_eq!(store.vector_id(1).unwrap(), 2);
+
+        // This kill point intentionally recovers the last complete record;
+        // partial-tail truncation remains covered by the lower-level WAL tests.
+        let (entries, valid_up_to) = Wal::read_entries(&wal_path).unwrap();
+        assert_eq!(entries.last().unwrap().vector_id, 2);
+        assert_eq!(valid_up_to, fs::metadata(&wal_path).unwrap().len());
     }
 
     #[test]

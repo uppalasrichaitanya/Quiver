@@ -112,7 +112,7 @@ impl FileHeader {
         let version = cursor
             .read_u8()
             .map_err(|e| QuiverError::InvalidFormat(format!("Failed to read version: {e}")))?;
-        if version > FORMAT_VERSION {
+        if !(LEGACY_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(QuiverError::InvalidFormat(format!(
                 "Unsupported format version: {version} (max supported: {FORMAT_VERSION})"
             )));

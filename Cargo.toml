@@ -4,6 +4,7 @@ members = [
     "quiver-server",
     "quiver-py",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

@@ -9,6 +9,7 @@
 //!   This is deliberately *not* ARIES-style recovery.
 //! - **Flush**: Periodic full mmap flush + fsync on a timer.
 
+pub mod format;
 pub mod header;
 pub mod wal;
 pub mod vecstore;
