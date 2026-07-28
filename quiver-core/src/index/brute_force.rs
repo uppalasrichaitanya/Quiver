@@ -15,7 +15,7 @@
 use std::collections::BinaryHeap;
 use std::path::Path;
 
-use crate::distance::{compute_distance, Metric};
+use crate::distance::{Metric, compute_distance};
 use crate::error::{QuiverError, Result};
 use crate::index::SearchResult;
 use crate::storage::vecstore::VectorStore;
@@ -38,10 +38,7 @@ impl BruteForceIndex {
     }
 
     /// Open an existing brute-force index, replaying the WAL for crash recovery.
-    pub fn open(
-        data_path: impl AsRef<Path>,
-        wal_path: impl AsRef<Path>,
-    ) -> Result<Self> {
+    pub fn open(data_path: impl AsRef<Path>, wal_path: impl AsRef<Path>) -> Result<Self> {
         let store = VectorStore::open(data_path, wal_path)?;
         Ok(Self { store })
     }
@@ -85,15 +82,15 @@ impl BruteForceIndex {
                     vector_id: slot as u64 + 1, // IDs are 1-based
                     distance,
                 });
-            } else if let Some(worst) = heap.peek() {
-                if distance < worst.distance {
-                    heap.pop();
-                    heap.push(SearchResult {
-                        slot,
-                        vector_id: slot as u64 + 1,
-                        distance,
-                    });
-                }
+            } else if let Some(worst) = heap.peek()
+                && distance < worst.distance
+            {
+                heap.pop();
+                heap.push(SearchResult {
+                    slot,
+                    vector_id: slot as u64 + 1,
+                    distance,
+                });
             }
         }
 
@@ -205,8 +202,8 @@ mod tests {
     fn test_search_cosine_returns_most_similar() {
         let (_dir, mut index) = setup(2, Metric::Cosine);
 
-        index.insert(&[1.0, 0.0]).unwrap();  // slot 0: pointing right
-        index.insert(&[0.0, 1.0]).unwrap();  // slot 1: pointing up
+        index.insert(&[1.0, 0.0]).unwrap(); // slot 0: pointing right
+        index.insert(&[0.0, 1.0]).unwrap(); // slot 1: pointing up
         index.insert(&[-1.0, 0.0]).unwrap(); // slot 2: pointing left
 
         // Query pointing right — most similar should be slot 0
@@ -318,8 +315,7 @@ mod tests {
 
         // Create, insert, flush
         {
-            let mut index =
-                BruteForceIndex::create(&data_path, &wal_path, 3, Metric::L2).unwrap();
+            let mut index = BruteForceIndex::create(&data_path, &wal_path, 3, Metric::L2).unwrap();
             index.insert(&[1.0, 0.0, 0.0]).unwrap();
             index.insert(&[0.0, 1.0, 0.0]).unwrap();
             index.flush().unwrap();

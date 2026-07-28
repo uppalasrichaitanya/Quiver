@@ -14,7 +14,9 @@ pub enum QuiverError {
     InvalidFormat(String),
 
     /// The WAL entry failed checksum validation.
-    #[error("WAL checksum mismatch at offset {offset}: expected {expected:#010x}, got {actual:#010x}")]
+    #[error(
+        "WAL checksum mismatch at offset {offset}: expected {expected:#010x}, got {actual:#010x}"
+    )]
     WalChecksumMismatch {
         offset: u64,
         expected: u32,

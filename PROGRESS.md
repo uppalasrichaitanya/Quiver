@@ -71,7 +71,7 @@ quiver/
 - Configurable `HnswConfig`: M, m_max0, ef_construction, ml, tombstone_ratio
 - Durable tombstone deletion restored from the WAL on reopen
 - Automatic live-only storage + graph compaction above the configured tombstone threshold
-- `parking_lot::RwLock` concurrency wrapper (v1: coarse-grained)
+- Single-threaded v1 API; mutation safety currently comes from `&mut self`
 - Graph rebuild from VectorStore on reopen
 - **Recall@10 > 95%** against brute-force ground truth (1000 vectors, 50 queries)
 
@@ -160,7 +160,7 @@ No special toolchain setup needed on Linux. AVX2+FMA will be auto-detected at ru
 
 | Decision | Rationale |
 |----------|-----------|
-| `parking_lot::RwLock` | Faster than std RwLock, writer-preferring; v1 is coarse-grained |
+| Single-threaded HNSW API | Mutation requires `&mut self`; an operational concurrent wrapper is not implemented yet |
 | mmap + WAL | Durability without full DB overhead; WAL cleared on flush |
 | FMA intrinsics | Single rounding = more accurate than scalar (slight float diff is expected) |
 | Relative tolerance in SIMD tests | FMA accumulation error grows with magnitude; absolute tolerance fails at dim≥255 |

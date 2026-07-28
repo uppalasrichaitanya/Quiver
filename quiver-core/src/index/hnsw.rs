@@ -14,16 +14,16 @@
 //!
 //! ## Concurrency model (v1)
 //!
-//! Single-writer, multi-reader via `parking_lot::RwLock`. Lock-free reads are a stretch goal.
+//! The public API is single-threaded in v1: mutation requires `&mut self`, and the index does not
+//! provide an internal synchronization wrapper. Concurrent access is a future API concern.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 
-use parking_lot::RwLock;
 use rand::Rng;
 
-use crate::distance::{compute_distance, Metric};
+use crate::distance::{Metric, compute_distance};
 use crate::error::{QuiverError, Result};
 use crate::index::SearchResult;
 use crate::storage::vecstore::VectorStore;
@@ -123,8 +123,6 @@ pub struct HnswIndex {
     config: HnswConfig,
     /// Number of tombstoned (deleted) nodes.
     tombstone_count: usize,
-    /// RwLock for concurrent access (v1: wraps the whole index).
-    _lock: RwLock<()>,
 }
 
 impl HnswIndex {
@@ -144,7 +142,6 @@ impl HnswIndex {
             max_level: 0,
             config,
             tombstone_count: 0,
-            _lock: RwLock::new(()),
         })
     }
 
@@ -165,7 +162,6 @@ impl HnswIndex {
             max_level: 0,
             config,
             tombstone_count: 0,
-            _lock: RwLock::new(()),
         };
 
         // Rebuild graph from stored vectors
@@ -367,8 +363,7 @@ impl HnswIndex {
     fn random_level(&self) -> usize {
         let mut rng = rand::rng();
         let r: f64 = rng.random();
-        let level = (-r.ln() * self.config.ml).floor() as usize;
-        level
+        (-r.ln() * self.config.ml).floor() as usize
     }
 
     /// Insert a vector into the HNSW graph (assumes it's already in the store).
@@ -416,12 +411,11 @@ impl HnswIndex {
             while changed {
                 changed = false;
                 // Clone the neighbor list to avoid borrow conflict
-                let neighbors: Vec<usize> =
-                    if level <= self.nodes[current].max_layer {
-                        self.nodes[current].neighbors[level].clone()
-                    } else {
-                        Vec::new()
-                    };
+                let neighbors: Vec<usize> = if level <= self.nodes[current].max_layer {
+                    self.nodes[current].neighbors[level].clone()
+                } else {
+                    Vec::new()
+                };
                 for neighbor_idx in neighbors {
                     let n_vec = match self.store.get_vector(self.nodes[neighbor_idx].slot) {
                         Ok(v) => v,
@@ -441,7 +435,8 @@ impl HnswIndex {
         let insert_from = new_level.min(self.max_level);
         for level in (0..=insert_from).rev() {
             let ef = self.config.ef_construction;
-            let candidates = match self.search_layer_for_insert(vector, current, ef, level, metric) {
+            let candidates = match self.search_layer_for_insert(vector, current, ef, level, metric)
+            {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -810,7 +805,10 @@ mod tests {
         }
 
         assert_eq!(index.total_nodes(), 100);
-        assert!(index.max_level() >= 1, "With 100 nodes, expect at least 2 layers");
+        assert!(
+            index.max_level() >= 1,
+            "With 100 nodes, expect at least 2 layers"
+        );
         assert!(index.entry_point.is_some());
 
         // Verify all nodes have valid neighbor references

@@ -1,6 +1,6 @@
 //! # Quiver Core
 //!
-//! Core vector search engine library implementing HNSW and IVF-PQ from scratch.
+//! Core vector search engine library implementing durable mmap storage and HNSW from scratch.
 //!
 //! This is a portfolio-grade, single-node, embeddable vector search engine.
 //! It is explicitly **not** a production service — see the README for positioning.
@@ -11,9 +11,7 @@
 //!
 //! - [`storage`] — Custom memory-mapped file format with versioned header and WAL
 //! - [`distance`] — Distance metrics (L2, cosine, dot product) with scalar and SIMD implementations
-//! - [`index`] — Index implementations (brute-force, HNSW, IVF-PQ)
-//! - [`quantization`] — Vector compression (SQ8, Product Quantization)
-//! - [`filter`] — Metadata storage and filtered search
+//! - [`index`] — Index implementations (brute-force and HNSW)
 //! - [`error`] — Unified error types
 
 pub mod distance;
@@ -21,6 +19,6 @@ pub mod error;
 pub mod index;
 pub mod storage;
 
-// Future modules (uncomment as implemented):
+// Future modules (uncomment only when implemented):
 // pub mod quantization;
 // pub mod filter;

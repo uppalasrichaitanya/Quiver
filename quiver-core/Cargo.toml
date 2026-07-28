@@ -4,10 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core vector search engine library for Quiver — implements HNSW, IVF-PQ, storage, and distance metrics"
+description = "Core vector search library for Quiver: mmap storage, WAL recovery, distance kernels, and HNSW"
 
 [dependencies]
-parking_lot = { workspace = true }
 tracing = { workspace = true }
 memmap2 = { workspace = true }
 crc32fast = { workspace = true }

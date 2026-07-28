@@ -424,7 +424,10 @@ mod tests {
         let a = vec![2.0, 3.0];
         let b = vec![4.0, 5.0];
         // dot = 23.0, negated = -23.0
-        assert!(approx_eq(compute_distance(&a, &b, Metric::DotProduct), -23.0));
+        assert!(approx_eq(
+            compute_distance(&a, &b, Metric::DotProduct),
+            -23.0
+        ));
     }
 
     #[test]

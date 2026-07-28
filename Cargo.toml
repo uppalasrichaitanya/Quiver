@@ -11,12 +11,11 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/YOUR_USERNAME/quiver-db"
-description = "A portfolio-grade, single-node, embeddable vector search engine implementing HNSW and IVF-PQ from scratch"
+repository = "https://github.com/uppalasrichaitanya/Quiver"
+description = "A portfolio-grade, single-node vector search engine implementing mmap storage and HNSW from scratch"
 
 [workspace.dependencies]
 # Core dependencies
-parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 memmap2 = "0.9"

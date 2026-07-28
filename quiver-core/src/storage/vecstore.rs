@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::distance::Metric;
 use crate::error::{QuiverError, Result};
-use crate::storage::format::{parse_file_bytes, VECTOR_ID_SIZE};
+use crate::storage::format::{VECTOR_ID_SIZE, parse_file_bytes};
 use crate::storage::header::{FileHeader, HEADER_SIZE, LEGACY_FORMAT_VERSION};
 use crate::storage::wal::{Wal, WalOp};
 
@@ -123,19 +123,13 @@ impl VectorStore {
     }
 
     /// Open an existing vector store, replaying the WAL for crash recovery.
-    pub fn open(
-        data_path: impl AsRef<Path>,
-        wal_path: impl AsRef<Path>,
-    ) -> Result<Self> {
+    pub fn open(data_path: impl AsRef<Path>, wal_path: impl AsRef<Path>) -> Result<Self> {
         let data_path = data_path.as_ref().to_path_buf();
         let wal_path_buf = wal_path.as_ref().to_path_buf();
         Self::recover_compaction(&data_path, &wal_path_buf)?;
 
         // Open and read the header
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&data_path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&data_path)?;
 
         let file_len = file.metadata()?.len();
         if file_len < HEADER_SIZE as u64 {
@@ -271,10 +265,7 @@ impl VectorStore {
         // SAFETY: f32 has alignment of 4, and our records are naturally aligned
         // after a 64-byte header. The data is valid because we wrote it.
         let floats = unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr() as *const f32,
-                self.header.dimension as usize,
-            )
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.header.dimension as usize)
         };
         Ok(floats)
     }
@@ -706,7 +697,10 @@ mod tests {
 
     #[test]
     fn test_open_truncated_final_record_returns_invalid_format_for_v1_and_v2() {
-        for version in [LEGACY_FORMAT_VERSION, crate::storage::header::FORMAT_VERSION] {
+        for version in [
+            LEGACY_FORMAT_VERSION,
+            crate::storage::header::FORMAT_VERSION,
+        ] {
             let dir = TempDir::new().unwrap();
             let data_path = dir.path().join(format!("truncated_v{version}.qvdb"));
             let wal_path = dir.path().join(format!("truncated_v{version}.wal"));
@@ -735,8 +729,7 @@ mod tests {
 
         // Create and insert
         {
-            let mut store =
-                VectorStore::create(&data_path, &wal_path, 3, Metric::Cosine).unwrap();
+            let mut store = VectorStore::create(&data_path, &wal_path, 3, Metric::Cosine).unwrap();
             store.insert(&[1.0, 2.0, 3.0]).unwrap();
             store.insert(&[4.0, 5.0, 6.0]).unwrap();
             store.flush().unwrap();
@@ -760,8 +753,7 @@ mod tests {
 
         // Create store and write to WAL but DON'T flush the main store properly
         {
-            let mut store =
-                VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
             // Insert goes through WAL
             store.insert(&[1.0, 2.0]).unwrap();
             store.insert(&[3.0, 4.0]).unwrap();
@@ -1064,10 +1056,8 @@ mod tests {
         store.insert(&[1.0, 2.0]).unwrap();
         store.insert(&[3.0, 4.0]).unwrap();
 
-        let collected: Vec<(usize, Vec<f32>)> = store
-            .iter()
-            .map(|(i, v)| (i, v.to_vec()))
-            .collect();
+        let collected: Vec<(usize, Vec<f32>)> =
+            store.iter().map(|(i, v)| (i, v.to_vec())).collect();
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0], (0, vec![1.0, 2.0]));
         assert_eq!(collected[1], (1, vec![3.0, 4.0]));

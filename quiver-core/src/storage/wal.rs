@@ -72,10 +72,7 @@ impl Wal {
     /// Open or create a WAL file at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let writer = BufWriter::new(file);
         Ok(Self { path, writer })
     }
@@ -265,7 +262,7 @@ impl Wal {
         match op {
             WalOp::Insert => {
                 let remaining = &body[9..];
-                if remaining.len() % 4 != 0 {
+                if !remaining.len().is_multiple_of(4) {
                     return None; // Not aligned to f32
                 }
                 let mut data = Vec::with_capacity(remaining.len() / 4);

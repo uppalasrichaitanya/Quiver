@@ -21,7 +21,7 @@
 //! (e.g., metadata support) don't break old indexes.
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{Cursor, Read, Write};
 
 use crate::distance::Metric;
 use crate::error::{QuiverError, Result};
@@ -122,21 +122,21 @@ impl FileHeader {
         let metric_byte = cursor
             .read_u8()
             .map_err(|e| QuiverError::InvalidFormat(format!("Failed to read metric: {e}")))?;
-        let metric = Metric::from_u8(metric_byte)
-            .ok_or_else(|| QuiverError::UnsupportedMetric(metric_byte))?;
+        let metric =
+            Metric::from_u8(metric_byte).ok_or(QuiverError::UnsupportedMetric(metric_byte))?;
 
         // Skip reserved padding (2 bytes)
         let mut _reserved = [0u8; 2];
-        cursor.read_exact(&mut _reserved).map_err(io::Error::from)?;
+        cursor.read_exact(&mut _reserved)?;
 
         // Read dimension
-        let dimension = cursor.read_u32::<LittleEndian>().map_err(io::Error::from)?;
+        let dimension = cursor.read_u32::<LittleEndian>()?;
 
         // Read vector count
-        let vector_count = cursor.read_u64::<LittleEndian>().map_err(io::Error::from)?;
+        let vector_count = cursor.read_u64::<LittleEndian>()?;
 
         // Read max vector ID
-        let max_vector_id = cursor.read_u64::<LittleEndian>().map_err(io::Error::from)?;
+        let max_vector_id = cursor.read_u64::<LittleEndian>()?;
 
         Ok(Self {
             version,

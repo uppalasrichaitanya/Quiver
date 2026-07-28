@@ -764,7 +764,6 @@ dependencies = [
  "crc32fast",
  "criterion",
  "memmap2",
- "parking_lot",
  "rand",
  "serde",
  "serde_json",
