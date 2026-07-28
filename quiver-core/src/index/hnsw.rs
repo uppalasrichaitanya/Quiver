@@ -177,6 +177,13 @@ impl HnswIndex {
                 let vector_id = slot as u64 + 1;
                 index.insert_into_graph(slot, vector_id, &vector);
             }
+
+            for node in &mut index.nodes {
+                if index.store.is_deleted(node.vector_id) {
+                    node.deleted = true;
+                    index.tombstone_count += 1;
+                }
+            }
         }
 
         Ok(index)
@@ -276,6 +283,8 @@ impl HnswIndex {
             .position(|n| n.vector_id == vector_id && !n.deleted)
             .ok_or(QuiverError::NotFound(vector_id))?;
 
+        // Persist the tombstone before making it visible in the graph.
+        self.store.delete(vector_id)?;
         self.nodes[node_idx].deleted = true;
         self.tombstone_count += 1;
 
@@ -785,5 +794,56 @@ mod tests {
             let results = index.search(&[1.0, 0.0, 0.0], 1, 50).unwrap();
             assert_eq!(results[0].slot, 0);
         }
+    }
+
+    #[test]
+    fn test_delete_persists_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_delete_persist.qvdb");
+        let wal_path = dir.path().join("hnsw_delete_persist.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+
+        let deleted_id;
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, config.clone()).unwrap();
+            deleted_id = index.insert(&[1.0, 0.0, 0.0]).unwrap();
+            index.insert(&[0.0, 1.0, 0.0]).unwrap();
+            index.insert(&[0.0, 0.0, 1.0]).unwrap();
+            index.delete(deleted_id).unwrap();
+            index.flush().unwrap();
+        }
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.tombstone_count, 1);
+
+        let results = index.search(&[1.0, 0.0, 0.0], 3, 50).unwrap();
+        assert!(results.iter().all(|result| result.vector_id != deleted_id));
+    }
+
+    #[test]
+    fn test_delete_recovers_after_unflushed_drop() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_delete_recovery.qvdb");
+        let wal_path = dir.path().join("hnsw_delete_recovery.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+
+        let deleted_id;
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, config.clone()).unwrap();
+            deleted_id = index.insert(&[1.0, 0.0, 0.0]).unwrap();
+            index.insert(&[0.0, 1.0, 0.0]).unwrap();
+            index.delete(deleted_id).unwrap();
+            // No index.flush(): both the inserts and delete must recover from WAL.
+        }
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.tombstone_count, 1);
+
+        let results = index.search(&[1.0, 0.0, 0.0], 2, 50).unwrap();
+        assert!(results.iter().all(|result| result.vector_id != deleted_id));
     }
 }

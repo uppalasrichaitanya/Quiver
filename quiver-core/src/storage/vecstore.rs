@@ -10,6 +10,7 @@
 //! ```
 
 use memmap2::{MmapMut, MmapOptions};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,8 @@ pub struct VectorStore {
     wal: Wal,
     /// Size of a single vector record in bytes (dimension * 4).
     record_size: usize,
+    /// Vector IDs durably tombstoned by delete records in the WAL.
+    deleted_ids: HashSet<u64>,
 }
 
 impl VectorStore {
@@ -62,7 +65,10 @@ impl VectorStore {
         mmap[..HEADER_SIZE].copy_from_slice(&header_bytes);
         mmap.flush()?;
 
-        let wal = Wal::open(wal_path)?;
+        let mut wal = Wal::open(wal_path)?;
+        // `create` defines a fresh store. Any WAL history from a previous
+        // database at these paths must not be replayed into it.
+        wal.clear()?;
 
         Ok(Self {
             _path: data_path,
@@ -71,6 +77,7 @@ impl VectorStore {
             header,
             wal,
             record_size,
+            deleted_ids: HashSet::new(),
         })
     }
 
@@ -99,33 +106,37 @@ impl VectorStore {
             header,
             wal: Wal::open(&wal_path_buf)?,
             record_size,
+            deleted_ids: HashSet::new(),
         };
 
-        // Replay WAL
+        // Replay WAL. Insert replay is idempotent: IDs at or below the
+        // checkpointed max ID are already present in the mmap file. Delete
+        // entries remain in the WAL as the durable tombstone source until
+        // compaction can checkpoint them into a rewritten store.
         let (entries, valid_up_to) = Wal::read_entries(&wal_path_buf)?;
         if !entries.is_empty() {
             tracing::info!(count = entries.len(), "Replaying WAL entries");
+            let mut recovered_inserts = false;
             for entry in &entries {
                 match entry.op {
                     WalOp::Insert => {
-                        if let Some(ref data) = entry.vector_data {
+                        if entry.vector_id > store.header.max_vector_id
+                            && let Some(ref data) = entry.vector_data
+                        {
                             store.insert_raw(entry.vector_id, data)?;
+                            recovered_inserts = true;
                         }
                     }
                     WalOp::Delete => {
-                        // Delete replay will be implemented with tombstones in Phase 5
-                        tracing::warn!(
-                            id = entry.vector_id,
-                            "Delete replay not yet implemented"
-                        );
+                        store.deleted_ids.insert(entry.vector_id);
                     }
                 }
             }
             // Truncate any corrupt tail
             Wal::truncate(&wal_path_buf, valid_up_to)?;
-            store.flush()?;
-            // Clear the WAL after successful replay + flush
-            store.wal.clear()?;
+            if recovered_inserts {
+                store.flush()?;
+            }
         }
 
         Ok(store)
@@ -152,6 +163,29 @@ impl VectorStore {
         self.insert_raw(vector_id, data)?;
 
         Ok(vector_id)
+    }
+
+    /// Durably mark a vector ID as deleted.
+    ///
+    /// The delete record is fsynced to the WAL before the in-memory tombstone
+    /// is updated, so a crash cannot acknowledge a delete that is then lost.
+    pub fn delete(&mut self, vector_id: u64) -> Result<()> {
+        if vector_id == 0
+            || vector_id > self.header.max_vector_id
+            || self.deleted_ids.contains(&vector_id)
+        {
+            return Err(QuiverError::NotFound(vector_id));
+        }
+
+        self.wal.log_delete(vector_id)?;
+        self.wal.flush()?;
+        self.deleted_ids.insert(vector_id);
+        Ok(())
+    }
+
+    /// Return whether a vector ID has been durably tombstoned.
+    pub fn is_deleted(&self, vector_id: u64) -> bool {
+        self.deleted_ids.contains(&vector_id)
     }
 
     /// Read a vector by its slot index (0-based).
@@ -201,18 +235,17 @@ impl VectorStore {
         self.header.metric
     }
 
-    /// Flush the memory-mapped file to disk (fsync) and clear the WAL.
+    /// Flush the memory-mapped file to disk (fsync).
     ///
-    /// After a successful flush, all data is durable in the main file,
-    /// so the WAL can be safely cleared to prevent double-replay on reopen.
+    /// Insert replay is idempotent, while delete entries remain in the WAL as
+    /// durable tombstones. A later compaction pass can rewrite the live vectors
+    /// and safely reset the WAL.
     pub fn flush(&mut self) -> Result<()> {
         // Update the header in the mmap
         let header_bytes = self.header.to_bytes();
         self.mmap[..HEADER_SIZE].copy_from_slice(&header_bytes);
         self.mmap.flush()?;
         self.file.sync_all()?;
-        // Clear the WAL — data is now durable in the main file
-        self.wal.clear()?;
         Ok(())
     }
 
@@ -392,6 +425,76 @@ mod tests {
             assert_eq!(store.get_vector(0).unwrap(), &[1.0, 2.0]);
             assert_eq!(store.get_vector(1).unwrap(), &[3.0, 4.0]);
         }
+    }
+
+    #[test]
+    fn test_delete_persists_after_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("delete_persist.qvdb");
+        let wal_path = dir.path().join("delete_persist.wal");
+
+        let deleted_id;
+        let live_id;
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            deleted_id = store.insert(&[1.0, 2.0]).unwrap();
+            live_id = store.insert(&[3.0, 4.0]).unwrap();
+            store.delete(deleted_id).unwrap();
+            store.flush().unwrap();
+        }
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(store.is_deleted(deleted_id));
+        assert!(!store.is_deleted(live_id));
+    }
+
+    #[test]
+    fn test_delete_recovers_without_store_flush() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("delete_recovery.qvdb");
+        let wal_path = dir.path().join("delete_recovery.wal");
+
+        let deleted_id;
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            deleted_id = store.insert(&[1.0, 2.0]).unwrap();
+            store.insert(&[3.0, 4.0]).unwrap();
+            store.delete(deleted_id).unwrap();
+            // Drop without flushing the mmap header, simulating recovery from
+            // operations that were durable only in the WAL.
+        }
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(store.is_deleted(deleted_id));
+        assert_eq!(store.get_vector(1).unwrap(), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_create_resets_previous_wal_history() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("recreate.qvdb");
+        let wal_path = dir.path().join("recreate.wal");
+
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            let id = store.insert(&[1.0, 2.0]).unwrap();
+            store.delete(id).unwrap();
+        }
+
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            let id = store.insert(&[3.0, 4.0]).unwrap();
+            store.flush().unwrap();
+            assert_eq!(id, 1);
+            assert!(!store.is_deleted(id));
+        }
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_deleted(1));
+        assert_eq!(store.get_vector(0).unwrap(), &[3.0, 4.0]);
     }
 
     #[test]

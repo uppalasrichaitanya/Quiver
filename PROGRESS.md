@@ -1,6 +1,6 @@
 # Quiver — Project Progress & Context Transfer
 
-> **Last updated:** 2026-07-22  
+> **Last updated:** 2026-07-28
 > **Purpose:** Context transfer document for continuing development on Linux
 
 ---
@@ -44,8 +44,9 @@ quiver/
 - **FileHeader** — 64-byte binary header with magic `QVDB`, format version, dimension, metric, vector count
 - **WAL** — Length-prefixed, CRC32-checksummed entries; supports Insert + Delete ops; truncates corrupt tails
 - **VectorStore** — mmap-backed vector storage with amortized 2x file growth
-- **Crash Recovery** — WAL replay on open; flush() syncs data + clears WAL atomically
-- **Bug fix:** WAL was not cleared on flush, causing double-replay on reopen (fixed)
+- **Crash Recovery** — WAL replay on open with idempotent insert recovery
+- **Durable Deletion** — delete records are fsynced before tombstones become visible and are restored on reopen
+- **Current checkpoint model:** flush() checkpoints mmap data while retaining WAL history so delete tombstones remain durable; WAL compaction is the next storage task
 
 ### Phase 3: Distance Metrics
 - **Scalar:** L2 squared, dot product, cosine similarity
@@ -64,7 +65,8 @@ quiver/
 - Multi-layer graph with exponential-decay layer assignment
 - Greedy + beam search (`ef_search` parameter)
 - Configurable `HnswConfig`: M, m_max0, ef_construction, ml, tombstone_ratio
-- Tombstone deletion with compaction trigger logging
+- Durable tombstone deletion restored from the WAL on reopen
+- Compaction trigger logging is present; the actual rebuild is still pending
 - `parking_lot::RwLock` concurrency wrapper (v1: coarse-grained)
 - Graph rebuild from VectorStore on reopen
 - **Recall@10 > 95%** against brute-force ground truth (1000 vectors, 50 queries)
@@ -72,7 +74,7 @@ quiver/
 ### Phase 6: SIMD Distance Kernels (PARTIALLY COMPLETE)
 - ✅ AVX2+FMA kernels for L2, dot product, cosine
 - ✅ Runtime feature detection + scalar fallback
-- ✅ Correctness validated (64 tests pass, including non-aligned dimensions)
+- ✅ Correctness validated (69 tests pass, including durable-delete recovery and non-aligned SIMD dimensions)
 - ✅ Criterion benchmark harness (scalar vs SIMD, index-level)
 - ⬜ Run benchmarks and capture before/after numbers
 - ⬜ Document SIMD speedup results
@@ -80,7 +82,7 @@ quiver/
 ## 📊 Test Status
 
 ```
-test result: ok. 64 passed; 0 failed; 0 ignored
+test result: ok. 69 passed; 0 failed; 0 ignored
 ```
 
 All tests pass as of the last run:
