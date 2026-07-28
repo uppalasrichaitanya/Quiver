@@ -174,7 +174,7 @@ impl HnswIndex {
             tracing::info!(count = n, "Rebuilding HNSW graph from stored vectors");
             for slot in 0..n {
                 let vector = index.store.get_vector(slot)?.to_vec();
-                let vector_id = slot as u64 + 1;
+                let vector_id = index.store.vector_id(slot)?;
                 index.insert_into_graph(slot, vector_id, &vector);
             }
 
@@ -295,10 +295,9 @@ impl HnswIndex {
                 tracing::info!(
                     tombstone_ratio = ratio,
                     threshold = self.config.max_tombstone_ratio,
-                    "Tombstone ratio exceeded threshold — compaction recommended"
+                    "Tombstone ratio exceeded threshold — compacting index"
                 );
-                // Full compaction (rebuild from live vectors) is deferred to a
-                // future PR — for now we just log the recommendation.
+                self.compact()?;
             }
         }
 
@@ -328,6 +327,28 @@ impl HnswIndex {
     /// Flush the underlying storage to disk.
     pub fn flush(&mut self) -> Result<()> {
         self.store.flush()
+    }
+
+    /// Rewrite storage with live vectors only and rebuild the HNSW graph.
+    pub fn compact(&mut self) -> Result<()> {
+        self.store.compact()?;
+        self.nodes.clear();
+        self.entry_point = None;
+        self.max_level = 0;
+        self.tombstone_count = 0;
+
+        for slot in 0..self.store.len() {
+            let vector = self.store.get_vector(slot)?.to_vec();
+            let vector_id = self.store.vector_id(slot)?;
+            self.insert_into_graph(slot, vector_id, &vector);
+        }
+
+        Ok(())
+    }
+
+    /// Return the current WAL size in bytes.
+    pub fn wal_len(&self) -> Result<u64> {
+        self.store.wal_len()
     }
 
     /// Return the total number of nodes (including tombstoned).
@@ -659,6 +680,7 @@ mod tests {
     #[test]
     fn test_delete_tombstone() {
         let (_dir, mut index) = setup(3, Metric::L2, 16);
+        index.config.max_tombstone_ratio = 1.0;
 
         let id1 = index.insert(&[1.0, 0.0, 0.0]).unwrap();
         index.insert(&[0.0, 1.0, 0.0]).unwrap();
@@ -679,6 +701,47 @@ mod tests {
         let (_dir, mut index) = setup(3, Metric::L2, 16);
         index.insert(&[1.0, 0.0, 0.0]).unwrap();
         assert!(index.delete(999).is_err());
+    }
+
+    #[test]
+    fn test_compaction_triggers_only_above_threshold() {
+        let (dir, mut index) = setup(3, Metric::L2, 8);
+        index.config.max_tombstone_ratio = 0.25;
+
+        let id1 = index.insert(&[1.0, 0.0, 0.0]).unwrap();
+        let id2 = index.insert(&[0.0, 1.0, 0.0]).unwrap();
+        let id3 = index.insert(&[0.0, 0.0, 1.0]).unwrap();
+        let id4 = index.insert(&[-1.0, 0.0, 0.0]).unwrap();
+
+        index.delete(id1).unwrap();
+        assert_eq!(index.total_nodes(), 4);
+        assert_eq!(index.tombstone_count, 1);
+        assert!(index.wal_len().unwrap() > 0);
+
+        index.delete(id2).unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.total_nodes(), 2);
+        assert_eq!(index.tombstone_count, 0);
+        assert_eq!(index.wal_len().unwrap(), 0);
+
+        let results = index.search(&[1.0, 0.0, 0.0], 4, 50).unwrap();
+        assert!(results.iter().all(|result| result.vector_id != id1));
+        assert!(results.iter().all(|result| result.vector_id != id2));
+        assert!(results.iter().any(|result| result.vector_id == id3));
+        assert!(results.iter().any(|result| result.vector_id == id4));
+
+        let config = index.config.clone();
+        drop(index);
+        let reopened = HnswIndex::open(
+            dir.path().join("hnsw_vectors.qvdb"),
+            dir.path().join("hnsw_vectors.wal"),
+            config,
+        )
+        .unwrap();
+        let results = reopened.search(&[1.0, 0.0, 0.0], 4, 50).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(results.iter().all(|result| result.vector_id != id1));
+        assert!(results.iter().all(|result| result.vector_id != id2));
     }
 
     #[test]
@@ -801,7 +864,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let data_path = dir.path().join("hnsw_delete_persist.qvdb");
         let wal_path = dir.path().join("hnsw_delete_persist.wal");
-        let config = HnswConfig::new(8).with_ef_construction(50);
+        let mut config = HnswConfig::new(8).with_ef_construction(50);
+        config.max_tombstone_ratio = 1.0;
 
         let deleted_id;
         {
@@ -827,7 +891,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let data_path = dir.path().join("hnsw_delete_recovery.qvdb");
         let wal_path = dir.path().join("hnsw_delete_recovery.wal");
-        let config = HnswConfig::new(8).with_ef_construction(50);
+        let mut config = HnswConfig::new(8).with_ef_construction(50);
+        config.max_tombstone_ratio = 1.0;
 
         let deleted_id;
         {

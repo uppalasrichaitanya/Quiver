@@ -46,7 +46,8 @@ quiver/
 - **VectorStore** — mmap-backed vector storage with amortized 2x file growth
 - **Crash Recovery** — WAL replay on open with idempotent insert recovery
 - **Durable Deletion** — delete records are fsynced before tombstones become visible and are restored on reopen
-- **Current checkpoint model:** flush() checkpoints mmap data while retaining WAL history so delete tombstones remain durable; WAL compaction is the next storage task
+- **Crash-safe compaction** — rewrites live vectors to a durable replacement, journals the data/WAL swap, and resets the WAL only after installation
+- **Stable IDs after compaction** — format v2 stores an explicit u64 vector ID per record; format v1 remains readable
 
 ### Phase 3: Distance Metrics
 - **Scalar:** L2 squared, dot product, cosine similarity
@@ -66,7 +67,7 @@ quiver/
 - Greedy + beam search (`ef_search` parameter)
 - Configurable `HnswConfig`: M, m_max0, ef_construction, ml, tombstone_ratio
 - Durable tombstone deletion restored from the WAL on reopen
-- Compaction trigger logging is present; the actual rebuild is still pending
+- Automatic live-only storage + graph compaction above the configured tombstone threshold
 - `parking_lot::RwLock` concurrency wrapper (v1: coarse-grained)
 - Graph rebuild from VectorStore on reopen
 - **Recall@10 > 95%** against brute-force ground truth (1000 vectors, 50 queries)
@@ -74,7 +75,7 @@ quiver/
 ### Phase 6: SIMD Distance Kernels (PARTIALLY COMPLETE)
 - ✅ AVX2+FMA kernels for L2, dot product, cosine
 - ✅ Runtime feature detection + scalar fallback
-- ✅ Correctness validated (69 tests pass, including durable-delete recovery and non-aligned SIMD dimensions)
+- ✅ Correctness validated (75 tests pass, including durable deletion, kill-mid-compaction recovery, legacy-format migration, and non-aligned SIMD dimensions)
 - ✅ Criterion benchmark harness (scalar vs SIMD, index-level)
 - ⬜ Run benchmarks and capture before/after numbers
 - ⬜ Document SIMD speedup results
@@ -82,7 +83,7 @@ quiver/
 ## 📊 Test Status
 
 ```
-test result: ok. 69 passed; 0 failed; 0 ignored
+test result: ok. 75 passed; 0 failed; 0 ignored
 ```
 
 All tests pass as of the last run:

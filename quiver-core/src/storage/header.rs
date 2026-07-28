@@ -6,12 +6,12 @@
 //! Offset  Size  Field
 //! ------  ----  -----
 //! 0       4     Magic bytes: b"QVDB"
-//! 4       1     Format version (currently 1)
+//! 4       1     Format version (currently 2)
 //! 5       1     Metric type (0 = L2, 1 = DotProduct, 2 = Cosine)
 //! 6       2     Reserved (padding, zeroed)
 //! 8       4     Vector dimension (u32, little-endian)
 //! 12      8     Vector count (u64, little-endian)
-//! 20      4     Max vector ID assigned so far (u64, little-endian)
+//! 20      8     Max vector ID assigned so far (u64, little-endian)
 //! 28      36    Reserved for future use (zeroed)
 //! ------  ----
 //! 64      Total header size
@@ -29,8 +29,11 @@ use crate::error::{QuiverError, Result};
 /// Magic bytes identifying a Quiver database file.
 pub const MAGIC: &[u8; 4] = b"QVDB";
 
-/// Current file format version.
-pub const FORMAT_VERSION: u8 = 1;
+/// Legacy format with raw f32 records and implicit `slot + 1` vector IDs.
+pub const LEGACY_FORMAT_VERSION: u8 = 1;
+
+/// Current format with an explicit u64 vector ID at the start of each record.
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Total size of the file header in bytes.
 pub const HEADER_SIZE: usize = 64;
@@ -193,6 +196,14 @@ mod tests {
         let mut bytes = FileHeader::new(128, Metric::L2).to_bytes();
         bytes[4] = 255; // future version
         assert!(FileHeader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_legacy_version_is_still_accepted() {
+        let mut bytes = FileHeader::new(128, Metric::L2).to_bytes();
+        bytes[4] = LEGACY_FORMAT_VERSION;
+        let header = FileHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(header.version, LEGACY_FORMAT_VERSION);
     }
 
     #[test]
