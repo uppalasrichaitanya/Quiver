@@ -17,8 +17,8 @@
 pub mod distance;
 pub mod error;
 pub mod index;
+pub mod quantization;
 pub mod storage;
 
 // Future modules (uncomment only when implemented):
-// pub mod quantization;
 // pub mod filter;

@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use quiver_core::distance::Metric;
 use quiver_core::index::brute_force::BruteForceIndex;
 use quiver_core::index::hnsw::{HnswConfig, HnswIndex};
+use quiver_core::index::sq8::Sq8Index;
 
 /// Generate a dataset of random vectors.
 fn generate_dataset(n: usize, dim: usize) -> Vec<Vec<f32>> {
@@ -121,6 +122,32 @@ fn bench_brute_force_search(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sq8_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sq8_search");
+    let dim = 128;
+    let k = 10;
+    let mut rng = rand::rng();
+
+    for n in [1000, 5000, 10_000] {
+        let vectors = generate_dataset(n, dim);
+        let index = Sq8Index::build(&vectors, Metric::L2).unwrap();
+        let queries: Vec<Vec<f32>> = (0..50)
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
+            .collect();
+
+        group.bench_with_input(BenchmarkId::new("n", n), &n, |bencher, _| {
+            let mut qi = 0;
+            bencher.iter(|| {
+                let q = &queries[qi % queries.len()];
+                qi += 1;
+                index.search(black_box(q), k).unwrap()
+            });
+        });
+    }
+
+    group.finish();
+}
+
 /// Measure recall@10 at various ef_search settings (not a benchmark per se,
 /// but useful to see the recall/speed tradeoff in the same harness).
 fn bench_recall_sweep(c: &mut Criterion) {
@@ -186,6 +213,7 @@ criterion_group!(
     bench_hnsw_insert,
     bench_hnsw_search,
     bench_brute_force_search,
+    bench_sq8_search,
     bench_recall_sweep
 );
 criterion_main!(benches);

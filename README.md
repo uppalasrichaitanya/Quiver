@@ -16,6 +16,7 @@ Implemented in `quiver-core`:
 - Bounds-checked file parsing for headers and records, plus a dedicated libFuzzer target.
 - Scalar and hand-written x86_64 AVX2/FMA kernels for L2, dot product, and cosine distance, with runtime dispatch and scalar fallback.
 - Exact brute-force search and multi-layer HNSW insert/search/delete.
+- Batch-built SQ8 flat search with per-dimension calibration, asymmetric distance evaluation, and one-byte vector components.
 - Tests comparing HNSW recall with brute-force ground truth and real subprocess-kill tests for ordinary WAL recovery and compaction recovery.
 
 The workspace includes an Axum server with insert, search, and delete endpoints, plus a PyO3 local `Index` API for the same core operations.
@@ -24,7 +25,7 @@ The workspace includes an Axum server with insert, search, and delete endpoints,
 
 - HNSW graph topology is not persisted; reopening reconstructs the graph from stored live vectors.
 - The HNSW API is single-threaded. Mutation safety comes from Rust's `&mut self`; there is no operational single-writer/multi-reader wrapper yet.
-- SQ8 and IVF-PQ are planned but not implemented.
+- SQ8 is currently an in-memory, batch-built index; online recalibration and persistence are not implemented. IVF-PQ remains planned.
 - Benchmark evidence, including reproducible SIFT1M comparisons and scalar/SIMD Criterion results, is documented in `benchmarks/`. A sampling flamegraph remains unavailable after the documented `samply` install attempt.
 - The crates have not yet been released to crates.io or PyPI.
 

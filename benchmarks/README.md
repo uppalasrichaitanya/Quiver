@@ -3,7 +3,8 @@
 This directory contains a single-threaded SIFT1M comparison of Quiver HNSW,
 FAISS `IndexHNSWFlat`, and hnswlib. Raw JSON under
 [`results/2026-07-28-i7-12650h/raw`](results/2026-07-28-i7-12650h/raw) is the
-source of truth.
+source of truth for the HNSW runs. SQ8 and brute-force memory results are under
+[`results/2026-07-29-i7-12650h/raw`](results/2026-07-29-i7-12650h/raw).
 
 ## Hardware and methodology
 
@@ -56,6 +57,25 @@ Recall@100 is not run for ef<100 because `efSearch` must be at least k.
 | hnswlib | 200 | 0.5809 / 1.2400 | 0.6042 / 1.4282 |
 | hnswlib | 400 | 1.1126 / 2.1862 | 1.1102 / 2.6400 |
 
+## SQ8 recall and throughput
+
+SQ8 uses a full flat scan with an asymmetric L2 lookup table. The comparison
+below uses all 1,000,000 SIFT base vectors and all 10,000 queries at k=10.
+HNSW rows use the existing M=32, efConstruction=200, efSearch=100 runs.
+SQ8 here is exhaustive (it checks every vector), so its recall advantage over
+Quiver's HNSW is exact search with quantization error versus approximate search
+with graph and implementation gaps, not evidence that "SQ8 is better."
+SQ8's low QPS is structural because it performs an O(n) scan; combining
+quantization with an index structure, as IVF-PQ actually does, is how to get
+both memory savings and speed.
+
+| Engine | Search parameters | Recall@10 | QPS |
+|---|---|---:|---:|
+| Quiver SQ8 flat | exhaustive scan | 0.9889 | 14.6 |
+| Quiver HNSW | M=32, efC=200, ef=100 | 0.9595 | 945.3 |
+| FAISS HNSW | M=32, efC=200, ef=100 | 0.9922 | 2336.3 |
+| hnswlib HNSW | M=32, efC=200, ef=100 | 0.9920 | 2832.4 |
+
 ## RSS / serialized size (index growth)
 
 `index_rss_delta_bytes` is the process RSS increase after loading queries and
@@ -66,6 +86,23 @@ ground truth. It is the comparable index-growth metric in these runs.
 | 16 / 100 | 1227.6 | 633.8 | 784.7 |
 | 16 / 200 | 1245.1 | 633.8 | 785.2 |
 | 32 / 200 | 2397.7 | 755.9 | 906.3 |
+
+The SQ8 and full-precision brute-force measurements below use separate
+single-threaded processes at the same 1,000,000-vector count. As above,
+RSS means process working-set growth after queries and ground truth are loaded.
+The HNSW value is the existing M=32, efConstruction=200 result.
+
+| Quiver index | Index RSS MB | Vector payload MB |
+|---|---:|---:|
+| SQ8 flat | 123.2 | 122.1 |
+| Full-precision brute-force | 504.8 | 488.3 |
+| HNSW, M=32 / efC=200 | 2397.7 | 488.3 plus graph |
+
+SQ8 reduced measured RSS by 4.10x versus the mmap-backed brute-force process,
+consistent with its exactly 4x-smaller encoded vector payload. The original
+1.98x figure understated the reduction because RSS was sampled while the
+brute-force mmap was only partially resident, not because SQ8 fell short of its
+compression ratio; the corrected benchmark scans every vector first.
 
 The M=32 Quiver RSS gap is expected from the current graph representation, not
 just vector storage: every node owns a `Vec<Vec<usize>>` (one heap allocation

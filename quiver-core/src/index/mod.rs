@@ -7,9 +7,12 @@
 //!   small datasets.
 //! - [`HnswIndex`](hnsw::HnswIndex) — Approximate nearest neighbor via hierarchical
 //!   navigable small world graph. The primary ANN structure.
+//! - [`Sq8Index`](sq8::Sq8Index) provides batch-built flat search over vectors
+//!   compressed to one byte per dimension.
 
 pub mod brute_force;
 pub mod hnsw;
+pub mod sq8;
 
 /// A single search result: the vector's internal ID and its distance from the query.
 #[derive(Debug, Clone, PartialEq)]

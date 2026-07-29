@@ -1,0 +1,17 @@
+{
+  "engine": "quiver-brute-force",
+  "dataset": "SIFT1M",
+  "dimension": 128,
+  "base_vectors": 1000000,
+  "queries": 10000,
+  "thread_count": 1,
+  "build_seconds": 303.4159633,
+  "baseline_rss_bytes": 14860288,
+  "rss_after_build_bytes": 544215040,
+  "index_rss_delta_bytes": 529354752,
+  "peak_rss_bytes": 544215040,
+  "vector_payload_bytes": 512000000,
+  "data_file_bytes": 546308096,
+  "wal_file_bytes": 529000000,
+  "search": null
+}

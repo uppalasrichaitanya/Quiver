@@ -1,0 +1,24 @@
+{
+  "engine": "quiver-sq8",
+  "dataset": "SIFT1M",
+  "dimension": 128,
+  "base_vectors": 1000000,
+  "queries": 10000,
+  "thread_count": 1,
+  "build_seconds": 2.226981,
+  "baseline_rss_bytes": 14868480,
+  "rss_after_build_bytes": 144056320,
+  "index_rss_delta_bytes": 129187840,
+  "peak_rss_bytes": 698224640,
+  "vector_payload_bytes": 128000000,
+  "data_file_bytes": null,
+  "wal_file_bytes": null,
+  "search": {
+    "k": 10,
+    "recall": 0.98888999999998,
+    "qps": 14.57308662694107,
+    "p50_latency_ms": 66.5307,
+    "p99_latency_ms": 118.6056,
+    "total_seconds": 686.1964288
+  }
+}
