@@ -67,6 +67,16 @@ ground truth. It is the comparable index-growth metric in these runs.
 | 16 / 200 | 1245.1 | 633.8 | 785.2 |
 | 32 / 200 | 2397.7 | 755.9 | 906.3 |
 
+The M=32 Quiver RSS gap is expected from the current graph representation, not
+just vector storage: every node owns a `Vec<Vec<usize>>` (one heap allocation
+for the outer layer list and generally one for each populated neighbor list),
+and each neighbor is a pointer-width `usize`. FAISS and hnswlib store graph
+links in compact contiguous native buffers. Quiver also keeps its durable vector
+store/WAL mapping resident. Replacing the nested per-node allocations with a
+packed contiguous adjacency arena and 32-bit node IDs is a known memory
+optimization opportunity; it should materially reduce allocator overhead and
+the ~2.4 GB versus ~0.75-0.9 GB M=32 RSS gap.
+
 ## Recall-gap investigation
 
 Quiver does **not** implement the original HNSW heuristic/diversified
@@ -82,10 +92,11 @@ explained as an algorithmic difference, not an unexplained benchmark anomaly.
 Criterion results in `target/criterion` report scalar versus AVX2/FMA dispatch.
 At 128 dimensions, mean nanoseconds per call were: L2 7.12 SIMD vs 41.49
 scalar (5.8x), dot product 5.63 vs 37.52 (6.7x), and cosine 17.42 vs 77.81
-(4.5x). A flamegraph comparison was not captured on this Windows host because
-`cargo-flamegraph`/sampling profiler is not installed; the reproducible
-Criterion scalar/SIMD numbers are committed and provide the actionable kernel
-comparison.
+(4.5x). A flamegraph comparison was not captured: `samply` was attempted via
+`cargo install samply --locked`, but the install did not complete before the
+two-minute command limit and no `samply` executable was installed. The
+reproducible Criterion scalar/SIMD numbers are committed and provide the
+actionable kernel comparison.
 
 ## Run it
 

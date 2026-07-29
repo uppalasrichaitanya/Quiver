@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/uppalasrichaitanya/Quiver/actions/workflows/ci.yml/badge.svg)](https://github.com/uppalasrichaitanya/Quiver/actions/workflows/ci.yml)
 
-Quiver is a portfolio-grade, single-node vector database built from scratch in Rust. Its purpose is to demonstrate systems-engineering work—binary formats, mmap storage, write-ahead logging, crash recovery, graph indexing, SIMD, fuzzing, and honest measurement—in a repository that can be inspected and tested.
+Quiver is a portfolio-grade, single-node vector database built from scratch in Rust. Its purpose is to demonstrate systems-engineering workâ€”binary formats, mmap storage, write-ahead logging, crash recovery, graph indexing, SIMD, fuzzing, and honest measurementâ€”in a repository that can be inspected and tested.
 
 Quiver is **not production software** and is not intended to compete with Qdrant, Pinecone, FAISS, Milvus, or hnswlib. It currently lacks the operational hardening, feature breadth, and benchmark evidence required for those comparisons. The goal is correctness rigor and a transparent account of the remaining gap, not a claim that a small from-scratch implementation wins.
 
@@ -18,15 +18,14 @@ Implemented in `quiver-core`:
 - Exact brute-force search and multi-layer HNSW insert/search/delete.
 - Tests comparing HNSW recall with brute-force ground truth and real subprocess-kill tests for ordinary WAL recovery and compaction recovery.
 
-The workspace also contains an Axum server and PyO3 module, but they are scaffolds: the server only exposes `GET /health`, and Python only exposes `version()`.
+The workspace includes an Axum server with insert, search, and delete endpoints, plus a PyO3 local `Index` API for the same core operations.
 
 ## Known limitations
 
 - HNSW graph topology is not persisted; reopening reconstructs the graph from stored live vectors.
 - The HNSW API is single-threaded. Mutation safety comes from Rust's `&mut self`; there is no operational single-writer/multi-reader wrapper yet.
 - SQ8 and IVF-PQ are planned but not implemented.
-- The REST search API, useful Python bindings, and semantic-search demo are not implemented.
-- Existing Criterion benchmarks are local microbenchmarks. Reproducible SIFT1M results against FAISS and hnswlib—including recall, QPS, latency, memory, hardware disclosure, and profiling evidence—have not been produced yet.
+- Benchmark evidence, including reproducible SIFT1M comparisons and scalar/SIMD Criterion results, is documented in `benchmarks/`. A sampling flamegraph remains unavailable after the documented `samply` install attempt.
 - The crates have not yet been released to crates.io or PyPI.
 
 ## Build and test
@@ -66,6 +65,21 @@ A reproducible single-threaded SIFT1M comparison is available in
 [`benchmarks/`](benchmarks/README.md). It includes raw JSON for the complete
 Quiver/FAISS/hnswlib configuration sweep and documents the measured
 quality/cost trade-offs.
+
+## Semantic-search demo
+
+Run semantic search over a small real-text corpus through the HTTP API:
+
+```powershell
+$env:QUIVER_DIMENSION=384
+cargo run -p quiver-server
+# In another terminal:
+python examples/semantic_search.py
+```
+
+The server exposes `POST /vectors`, `POST /search`, and
+`DELETE /vectors/{id}`. A local native Python API is also available through
+[`quiver-py`](quiver-py/README.md).
 
 ## Workspace layout
 
