@@ -38,7 +38,7 @@ for text, vector in zip(CORPUS, vectors, strict=True):
 query = "Which language is designed for safe low-level software?"
 query_vector = model.transform([query]).astype("float32").toarray()[0].tolist()
 hits = request("POST", "/search", {"vector": query_vector, "k": 3, "ef_search": 50})
-print(f"query: {query}\\n")
+print(f"query: {query}\n")
 for rank, hit in enumerate(hits, 1):
     print(f"{rank}. {documents[hit['id']]}  (distance={hit['distance']:.4f})")
 

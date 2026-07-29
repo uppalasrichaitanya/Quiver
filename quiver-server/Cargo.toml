@@ -8,9 +8,6 @@ description = "REST API server for the Quiver vector search engine"
 
 [dependencies]
 quiver-core = { path = "../quiver-core" }
-axum = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -81,12 +81,14 @@ The server exposes `POST /vectors`, `POST /search`, and
 `DELETE /vectors/{id}`. A local native Python API is also available through
 [`quiver-py`](quiver-py/README.md).
 
+![Quiver semantic-search terminal demo](examples/semantic-search-demo.gif)
+
 ## Workspace layout
 
 ```text
 quiver-core/    mmap storage, WAL, distance kernels, brute-force, HNSW
-quiver-server/  Axum scaffold; health endpoint only
-quiver-py/      PyO3 scaffold; version function only
+quiver-server/  minimal HTTP insert/search/delete API
+quiver-py/      PyO3 local Index API
 fuzz/           dedicated file-format libFuzzer package and seed corpus
 ```
 

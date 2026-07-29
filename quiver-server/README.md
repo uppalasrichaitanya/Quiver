@@ -1,6 +1,6 @@
 # quiver-server
 
-The minimal HTTP API listens on `0.0.0.0:8080`:
+The minimal HTTP API listens on `127.0.0.1:8080`:
 
 - `GET /health`
 - `POST /vectors` with `{"vector":[...]}` → `{"id":...}`
