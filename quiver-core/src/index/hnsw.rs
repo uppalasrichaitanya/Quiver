@@ -21,7 +21,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 use crate::distance::{Metric, compute_distance};
 use crate::error::{QuiverError, Result};
@@ -43,6 +44,8 @@ pub struct HnswConfig {
     pub ml: f64,
     /// Maximum tombstone ratio before triggering compaction (e.g., 0.2 = 20%).
     pub max_tombstone_ratio: f64,
+    /// Seed used for deterministic HNSW layer assignment.
+    pub random_seed: u64,
 }
 
 impl HnswConfig {
@@ -54,12 +57,19 @@ impl HnswConfig {
             ef_construction: 200,
             ml: 1.0 / (m as f64).ln(),
             max_tombstone_ratio: 0.2,
+            random_seed: 42,
         }
     }
 
     /// Set ef_construction (builder pattern).
     pub fn with_ef_construction(mut self, ef: usize) -> Self {
         self.ef_construction = ef;
+        self
+    }
+
+    /// Set the deterministic random seed used for layer assignment.
+    pub fn with_random_seed(mut self, seed: u64) -> Self {
+        self.random_seed = seed;
         self
     }
 }
@@ -123,6 +133,8 @@ pub struct HnswIndex {
     config: HnswConfig,
     /// Number of tombstoned (deleted) nodes.
     tombstone_count: usize,
+    /// Deterministic random generator for layer assignment.
+    rng: StdRng,
 }
 
 impl HnswIndex {
@@ -135,6 +147,7 @@ impl HnswIndex {
         config: HnswConfig,
     ) -> Result<Self> {
         let store = VectorStore::create(data_path, wal_path, dimension, metric)?;
+        let rng = StdRng::seed_from_u64(config.random_seed);
         Ok(Self {
             store,
             nodes: Vec::new(),
@@ -142,6 +155,7 @@ impl HnswIndex {
             max_level: 0,
             config,
             tombstone_count: 0,
+            rng,
         })
     }
 
@@ -155,6 +169,7 @@ impl HnswIndex {
         config: HnswConfig,
     ) -> Result<Self> {
         let store = VectorStore::open(data_path, wal_path)?;
+        let rng = StdRng::seed_from_u64(config.random_seed);
         let mut index = Self {
             store,
             nodes: Vec::new(),
@@ -162,6 +177,7 @@ impl HnswIndex {
             max_level: 0,
             config,
             tombstone_count: 0,
+            rng,
         };
 
         // Rebuild graph from stored vectors
@@ -360,9 +376,8 @@ impl HnswIndex {
     // ── Private helpers ──────────────────────────────────────────────────
 
     /// Assign a random layer for a new node using the exponential decay formula.
-    fn random_level(&self) -> usize {
-        let mut rng = rand::rng();
-        let r: f64 = rng.random();
+    fn random_level(&mut self) -> usize {
+        let r: f64 = self.rng.random();
         (-r.ln() * self.config.ml).floor() as usize
     }
 

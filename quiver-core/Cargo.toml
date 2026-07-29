@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Core vector search library for Quiver: mmap storage, WAL recovery, distance kernels, and HNSW"
 
+[features]
+default = []
+force-scalar = []
+
 [dependencies]
 tracing = { workspace = true }
 memmap2 = { workspace = true }

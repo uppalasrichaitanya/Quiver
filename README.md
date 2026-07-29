@@ -62,6 +62,11 @@ cargo bench -p quiver-core
 
 These cover distance kernels and local brute-force/HNSW operations. They are development harnesses, not the final comparative benchmark suite, and no performance claim should be inferred from their presence. Phase 6 will profile the scalar path first and then commit reproducible, same-hardware comparisons with FAISS and hnswlib.
 
+A reproducible single-threaded SIFT1M comparison is available in
+[`benchmarks/`](benchmarks/README.md). It includes raw JSON for the complete
+Quiver/FAISS/hnswlib configuration sweep and documents the measured
+quality/cost trade-offs.
+
 ## Workspace layout
 
 ```text
