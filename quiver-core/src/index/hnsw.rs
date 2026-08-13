@@ -456,14 +456,12 @@ impl HnswIndex {
                 Err(_) => continue,
             };
 
-            // Select M nearest non-deleted neighbors
             let m_level = if level == 0 { m_max0 } else { m };
-            let selected: Vec<usize> = candidates
-                .iter()
+            let candidates: Vec<Candidate> = candidates
+                .into_iter()
                 .filter(|c| !self.nodes[c.node_idx].deleted && c.node_idx != new_node_idx)
-                .take(m_level)
-                .map(|c| c.node_idx)
                 .collect();
+            let selected = self.select_neighbors_heuristic(vector, &candidates, m_level, metric);
 
             // Set forward connections (new_node -> selected neighbors)
             self.nodes[new_node_idx].neighbors[level] = selected.clone();
@@ -581,6 +579,42 @@ impl HnswIndex {
         self.search_layer(query, entry_point, ef, level, metric)
     }
 
+    /// Select links using the HNSW diversified-neighbor heuristic. A candidate
+    /// is accepted only when it is not closer to an already selected neighbor
+    /// than it is to the query; rejected candidates fill unused capacity.
+    fn select_neighbors_heuristic(
+        &self,
+        query: &[f32],
+        candidates: &[Candidate],
+        max_connections: usize,
+        metric: Metric,
+    ) -> Vec<usize> {
+        let mut selected: Vec<usize> = Vec::with_capacity(max_connections);
+        let mut discarded: Vec<usize> = Vec::new();
+
+        for candidate in candidates {
+            let candidate_vec = match self.store.get_vector(self.nodes[candidate.node_idx].slot) {
+                Ok(vector) => vector,
+                Err(_) => continue,
+            };
+            let diverse = selected.iter().all(|&selected_idx| {
+                self.store
+                    .get_vector(self.nodes[selected_idx].slot)
+                    .map(|selected_vec| compute_distance(candidate_vec, selected_vec, metric) >= candidate.distance)
+                    .unwrap_or(false)
+            });
+            if diverse && selected.len() < max_connections {
+                selected.push(candidate.node_idx);
+            } else {
+                discarded.push(candidate.node_idx);
+            }
+        }
+
+        selected.extend(discarded.into_iter().take(max_connections.saturating_sub(selected.len())));
+        let _ = query;
+        selected
+    }
+
     /// Prune the connection list of a node at the given layer to max_conn connections.
     /// Keeps the closest neighbors by distance to the node's own vector.
     fn prune_connections(
@@ -597,20 +631,17 @@ impl HnswIndex {
             Err(_) => return,
         };
 
-        // Score all current neighbors by distance to this node
-        let mut scored: Vec<(usize, f32)> = self.nodes[node_idx].neighbors[level]
+        let mut candidates: Vec<Candidate> = self.nodes[node_idx].neighbors[level]
             .iter()
             .filter_map(|&n_idx| {
                 let n_vec = self.store.get_vector(self.nodes[n_idx].slot).ok()?;
                 let dist = compute_distance(&node_vec, n_vec, metric);
-                Some((n_idx, dist))
+                Some(Candidate { node_idx: n_idx, distance: dist })
             })
             .collect();
-
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        scored.truncate(max_conn);
-
-        self.nodes[node_idx].neighbors[level] = scored.into_iter().map(|(idx, _)| idx).collect();
+        candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        self.nodes[node_idx].neighbors[level] =
+            self.select_neighbors_heuristic(&node_vec, &candidates, max_conn, metric);
     }
 }
 
@@ -652,6 +683,34 @@ mod tests {
             index.insert(&[i as f32, 0.0, 0.0]).unwrap();
         }
         assert_eq!(index.len(), 20);
+    }
+
+    #[test]
+    fn diversified_selection_keeps_a_farther_bridge_candidate() {
+        let (_dir, mut index) = setup(1, Metric::L2, 4);
+        index.insert(&[1.0]).unwrap();
+        index.insert(&[1.1]).unwrap();
+        index.insert(&[-2.0]).unwrap();
+
+        let candidates = vec![
+            Candidate {
+                node_idx: 0,
+                distance: 1.0,
+            },
+            Candidate {
+                node_idx: 1,
+                distance: 1.21,
+            },
+            Candidate {
+                node_idx: 2,
+                distance: 4.0,
+            },
+        ];
+
+        let selected =
+            index.select_neighbors_heuristic(&[0.0], &candidates, 2, Metric::L2);
+
+        assert_eq!(selected, vec![0, 2]);
     }
 
     #[test]
