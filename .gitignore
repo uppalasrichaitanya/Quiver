@@ -20,6 +20,9 @@ __pycache__/
 dist/
 .venv/
 
+# Local feature worktrees
+/.worktrees/
+
 # Benchmark data (large files)
 *.fvecs
 *.ivecs
