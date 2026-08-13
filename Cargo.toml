@@ -31,9 +31,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Server (Phase 10)
+# Server
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 
-# Python bindings (Phase 10)
+# Python bindings
 pyo3 = { version = "0.23", features = ["extension-module"] }

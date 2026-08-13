@@ -19,7 +19,7 @@ Implemented in `quiver-core`:
 - Batch-built SQ8 flat search with per-dimension calibration, asymmetric distance evaluation, and one-byte vector components.
 - Tests comparing HNSW recall with brute-force ground truth and real subprocess-kill tests for ordinary WAL recovery and compaction recovery.
 
-The workspace includes an Axum server with insert, search, and delete endpoints, plus a PyO3 local `Index` API for the same core operations.
+The workspace includes an Axum server with insert, search, and delete endpoints, plus a PyO3 local `Index` API for the same core operations. The server accepts concurrent HTTP connections around one mutex-protected HNSW index; mutations remain serialized by the core API's single-writer model.
 
 ## Known limitations
 
@@ -78,6 +78,14 @@ cargo run -p quiver-server
 python examples/semantic_search.py
 ```
 
+On Windows GNU, use the 64-bit MSYS2 MinGW64 tools first in `PATH`:
+
+```powershell
+$env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "")
+```
+
+Axum was temporarily removed in an earlier commit because `C:\MinGW\bin\dlltool.exe` was selected and failed to create 64-bit import libraries with `Invalid bfd target`. That was a PATH/toolchain conflict, not an Axum or Tokio limitation. Axum is restored, and the server now opens an existing index on restart or creates one when the configured data path does not exist.
+
 The server exposes `POST /vectors`, `POST /search`, and
 `DELETE /vectors/{id}`. A local native Python API is also available through
 [`quiver-py`](quiver-py/README.md).
@@ -88,7 +96,7 @@ The server exposes `POST /vectors`, `POST /search`, and
 
 ```text
 quiver-core/    mmap storage, WAL, distance kernels, brute-force, HNSW
-quiver-server/  minimal HTTP insert/search/delete API
+quiver-server/  Axum HTTP insert/search/delete API
 quiver-py/      PyO3 local Index API
 fuzz/           dedicated file-format libFuzzer package and seed corpus
 ```
