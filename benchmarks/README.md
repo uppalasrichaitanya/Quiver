@@ -104,25 +104,28 @@ consistent with its exactly 4x-smaller encoded vector payload. The original
 brute-force mmap was only partially resident, not because SQ8 fell short of its
 compression ratio; the corrected benchmark scans every vector first.
 
-The M=32 Quiver RSS gap is expected from the current graph representation, not
+The July 2026 M=32 Quiver RSS gap is expected from the graph representation used for that benchmark, not
 just vector storage: every node owns a `Vec<Vec<usize>>` (one heap allocation
 for the outer layer list and generally one for each populated neighbor list),
 and each neighbor is a pointer-width `usize`. FAISS and hnswlib store graph
 links in compact contiguous native buffers. Quiver also keeps its durable vector
 store/WAL mapping resident. Replacing the nested per-node allocations with a
 packed contiguous adjacency arena and 32-bit node IDs is a known memory
-optimization opportunity; it should materially reduce allocator overhead and
-the ~2.4 GB versus ~0.75-0.9 GB M=32 RSS gap.
+optimization opportunity. The implementation now uses packed `u32` adjacency blocks, but the same-host SIFT1M RSS rerun is pending, so the magnitude of the reduction is not yet claimed.
 
 ## Recall-gap investigation
 
-Quiver does **not** implement the original HNSW heuristic/diversified
+The July 2026 Quiver benchmark did **not** implement the original HNSW heuristic/diversified
 neighbor-selection rule. In `hnsw.rs`, insertion selects the first `M` nearest
 construction candidates, and `prune_connections` sorts by distance to the node
 and truncates to capacity. FAISS and hnswlib use diversified pruning. This is a
 plausible primary cause of the matched M=32/efC=200 recall gap (Quiver 0.9595
 versus FAISS 0.9922 and hnswlib 0.9920 at efSearch=100); the gap is therefore
-explained as an algorithmic difference, not an unexplained benchmark anomaly.
+explained as an algorithmic difference, not an unexplained benchmark anomaly. The implementation now uses diversified selection, but a same-host SIFT1M rerun is required before claiming the recall gap has closed.
+
+## Phase 3 measurement status
+
+The HNSW implementation now uses diversified neighbor selection for both new-node links and reverse-link pruning, plus fixed-capacity packed `u32` adjacency blocks. The committed baseline SIFT1M corpus is not present in this workspace, so no new macro-benchmark values are claimed here. Re-run the existing `sift_benchmark` command with the original SIFT1M base, query, and ground-truth files on the same host before comparing recall, latency, build time, or RSS with the July 2026 baseline.
 
 ## Distance-kernel measurements
 

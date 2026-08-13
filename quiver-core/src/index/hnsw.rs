@@ -91,9 +91,16 @@ struct HnswNode {
     max_layer: usize,
     /// Neighbor lists for each layer. neighbors[l] contains the neighbor node indices
     /// (indices into HnswIndex::nodes, not slot indices).
-    neighbors: Vec<Vec<usize>>,
+    levels: Vec<LevelBlock>,
     /// Whether this node has been deleted (tombstone).
     deleted: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LevelBlock {
+    offset: usize,
+    len: usize,
+    capacity: usize,
 }
 
 /// A candidate during search: node index + distance.
@@ -125,6 +132,8 @@ pub struct HnswIndex {
     store: VectorStore,
     /// The HNSW graph nodes.
     nodes: Vec<HnswNode>,
+    /// Fixed-capacity adjacency blocks containing 32-bit node IDs.
+    adjacency_links: Vec<u32>,
     /// Index of the current entry point node (topmost layer).
     entry_point: Option<usize>,
     /// Maximum layer currently in the graph.
@@ -151,6 +160,7 @@ impl HnswIndex {
         Ok(Self {
             store,
             nodes: Vec::new(),
+            adjacency_links: Vec::new(),
             entry_point: None,
             max_level: 0,
             config,
@@ -173,6 +183,7 @@ impl HnswIndex {
         let mut index = Self {
             store,
             nodes: Vec::new(),
+            adjacency_links: Vec::new(),
             entry_point: None,
             max_level: 0,
             config,
@@ -252,8 +263,8 @@ impl HnswIndex {
             let mut changed = true;
             while changed {
                 changed = false;
-                let neighbors = &self.nodes[current].neighbors[level];
-                for &neighbor_idx in neighbors {
+                let neighbors = self.neighbors(current, level);
+                for neighbor_idx in neighbors {
                     if self.nodes[neighbor_idx].deleted {
                         continue;
                     }
@@ -345,6 +356,7 @@ impl HnswIndex {
     pub fn compact(&mut self) -> Result<()> {
         self.store.compact()?;
         self.nodes.clear();
+        self.adjacency_links.clear();
         self.entry_point = None;
         self.max_level = 0;
         self.tombstone_count = 0;
@@ -381,6 +393,30 @@ impl HnswIndex {
         (-r.ln() * self.config.ml).floor() as usize
     }
 
+    fn neighbors(&self, node_idx: usize, level: usize) -> Vec<usize> {
+        let block = self.nodes[node_idx].levels[level];
+        self.adjacency_links[block.offset..block.offset + block.len]
+            .iter()
+            .map(|&link| link as usize)
+            .collect()
+    }
+
+    fn replace_neighbors(&mut self, node_idx: usize, level: usize, neighbors: &[usize]) {
+        let block = self.nodes[node_idx].levels[level];
+        assert!(
+            neighbors.len() <= block.capacity,
+            "neighbor list exceeds fixed capacity"
+        );
+        for (slot, &neighbor_idx) in self.adjacency_links
+            [block.offset..block.offset + neighbors.len()]
+            .iter_mut()
+            .zip(neighbors)
+        {
+            *slot = u32::try_from(neighbor_idx).expect("node index exceeds u32 capacity");
+        }
+        self.nodes[node_idx].levels[level].len = neighbors.len();
+    }
+
     /// Insert a vector into the HNSW graph (assumes it's already in the store).
     fn insert_into_graph(&mut self, slot: usize, vector_id: u64, vector: &[f32]) {
         let new_level = self.random_level();
@@ -389,15 +425,22 @@ impl HnswIndex {
         // Create the new node
         let m_max0 = self.config.m_max0;
         let m = self.config.m;
-        let mut neighbors = Vec::with_capacity(new_level + 1);
-        for _ in 0..=new_level {
-            neighbors.push(Vec::new());
+        let mut levels = Vec::with_capacity(new_level + 1);
+        for level in 0..=new_level {
+            let capacity = if level == 0 { m_max0 } else { m };
+            let offset = self.adjacency_links.len();
+            self.adjacency_links.resize(offset + capacity, 0);
+            levels.push(LevelBlock {
+                offset,
+                len: 0,
+                capacity,
+            });
         }
         let new_node = HnswNode {
             slot,
             vector_id,
             max_layer: new_level,
-            neighbors,
+            levels,
             deleted: false,
         };
         let new_node_idx = self.nodes.len();
@@ -427,7 +470,7 @@ impl HnswIndex {
                 changed = false;
                 // Clone the neighbor list to avoid borrow conflict
                 let neighbors: Vec<usize> = if level <= self.nodes[current].max_layer {
-                    self.nodes[current].neighbors[level].clone()
+                    self.neighbors(current, level)
                 } else {
                     Vec::new()
                 };
@@ -464,17 +507,24 @@ impl HnswIndex {
             let selected = self.select_neighbors_heuristic(vector, &candidates, m_level, metric);
 
             // Set forward connections (new_node -> selected neighbors)
-            self.nodes[new_node_idx].neighbors[level] = selected.clone();
+            self.replace_neighbors(new_node_idx, level, &selected);
 
             // Set reverse connections (each selected neighbor -> new_node)
             for &neighbor_idx in &selected {
                 if level <= self.nodes[neighbor_idx].max_layer {
-                    self.nodes[neighbor_idx].neighbors[level].push(new_node_idx);
-
-                    // Prune if over capacity
                     let max_conn = if level == 0 { m_max0 } else { m };
-                    if self.nodes[neighbor_idx].neighbors[level].len() > max_conn {
-                        self.prune_connections(neighbor_idx, level, max_conn, vector, metric);
+                    let mut reverse_neighbors = self.neighbors(neighbor_idx, level);
+                    reverse_neighbors.push(new_node_idx);
+                    if reverse_neighbors.len() > max_conn {
+                        self.prune_connections(
+                            neighbor_idx,
+                            level,
+                            max_conn,
+                            &reverse_neighbors,
+                            metric,
+                        );
+                    } else {
+                        self.replace_neighbors(neighbor_idx, level, &reverse_neighbors);
                     }
                 }
             }
@@ -530,12 +580,12 @@ impl HnswIndex {
 
             // Explore neighbors
             let neighbors = if level <= self.nodes[current.node_idx].max_layer {
-                &self.nodes[current.node_idx].neighbors[level]
+                self.neighbors(current.node_idx, level)
             } else {
                 continue;
             };
 
-            for &neighbor_idx in neighbors {
+            for neighbor_idx in neighbors {
                 if !visited.insert(neighbor_idx) {
                     continue;
                 }
@@ -600,7 +650,9 @@ impl HnswIndex {
             let diverse = selected.iter().all(|&selected_idx| {
                 self.store
                     .get_vector(self.nodes[selected_idx].slot)
-                    .map(|selected_vec| compute_distance(candidate_vec, selected_vec, metric) >= candidate.distance)
+                    .map(|selected_vec| {
+                        compute_distance(candidate_vec, selected_vec, metric) >= candidate.distance
+                    })
                     .unwrap_or(false)
             });
             if diverse && selected.len() < max_connections {
@@ -610,7 +662,11 @@ impl HnswIndex {
             }
         }
 
-        selected.extend(discarded.into_iter().take(max_connections.saturating_sub(selected.len())));
+        selected.extend(
+            discarded
+                .into_iter()
+                .take(max_connections.saturating_sub(selected.len())),
+        );
         let _ = query;
         selected
     }
@@ -622,7 +678,7 @@ impl HnswIndex {
         node_idx: usize,
         level: usize,
         max_conn: usize,
-        _new_vector: &[f32],
+        neighbors: &[usize],
         metric: Metric,
     ) {
         let node_slot = self.nodes[node_idx].slot;
@@ -631,17 +687,21 @@ impl HnswIndex {
             Err(_) => return,
         };
 
-        let mut candidates: Vec<Candidate> = self.nodes[node_idx].neighbors[level]
+        let mut candidates: Vec<Candidate> = neighbors
             .iter()
-            .filter_map(|&n_idx| {
+            .copied()
+            .filter_map(|n_idx| {
                 let n_vec = self.store.get_vector(self.nodes[n_idx].slot).ok()?;
                 let dist = compute_distance(&node_vec, n_vec, metric);
-                Some(Candidate { node_idx: n_idx, distance: dist })
+                Some(Candidate {
+                    node_idx: n_idx,
+                    distance: dist,
+                })
             })
             .collect();
         candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        self.nodes[node_idx].neighbors[level] =
-            self.select_neighbors_heuristic(&node_vec, &candidates, max_conn, metric);
+        let selected = self.select_neighbors_heuristic(&node_vec, &candidates, max_conn, metric);
+        self.replace_neighbors(node_idx, level, &selected);
     }
 }
 
@@ -707,10 +767,21 @@ mod tests {
             },
         ];
 
-        let selected =
-            index.select_neighbors_heuristic(&[0.0], &candidates, 2, Metric::L2);
+        let selected = index.select_neighbors_heuristic(&[0.0], &candidates, 2, Metric::L2);
 
         assert_eq!(selected, vec![0, 2]);
+    }
+
+    #[test]
+    fn packed_adjacency_uses_fixed_u32_blocks() {
+        let (_dir, mut index) = setup(2, Metric::L2, 4);
+        index.insert(&[0.0, 0.0]).unwrap();
+
+        let node = &index.nodes[0];
+        assert_eq!(node.levels.len(), node.max_layer + 1);
+        assert_eq!(node.levels[0].capacity, index.config.m_max0);
+        assert_eq!(index.adjacency_links.len(), index.config.m_max0);
+        assert_eq!(std::mem::size_of_val(&index.adjacency_links[0]), 4);
     }
 
     #[test]
@@ -887,8 +958,8 @@ mod tests {
 
         // Verify all nodes have valid neighbor references
         for (idx, node) in index.nodes.iter().enumerate() {
-            for (level, neighbors) in node.neighbors.iter().enumerate() {
-                for &neighbor_idx in neighbors {
+            for level in 0..node.levels.len() {
+                for neighbor_idx in index.neighbors(idx, level) {
                     assert!(
                         neighbor_idx < index.nodes.len(),
                         "Node {idx} at level {level} has invalid neighbor {neighbor_idx}"

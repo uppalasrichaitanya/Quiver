@@ -29,7 +29,7 @@ benchmarks/     reproducible Criterion and SIFT1M comparisons
 
 ## Verification Status
 
-The latest workspace run has **95 tests passing** with zero failures: 94 existing workspace/unit tests plus the server-process restart persistence integration test. CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing.
+The latest workspace run has **97 tests passing** with zero failures: 96 workspace/unit tests plus the server-process restart persistence integration test. CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing.
 
 ## Known Limitations
 
@@ -51,7 +51,7 @@ $env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "
 ## Next Phases
 
 1. Complete project hygiene and API lifecycle (this phase).
-2. Improve HNSW diversified neighbor selection and packed adjacency memory layout.
+2. HNSW diversified neighbor selection and packed 32-bit fixed-capacity adjacency are implemented and covered by unit/regression tests. Same-host SIFT1M reruns are pending because the dataset files are not present in this workspace.
 3. Add metadata and filtered search, starting with post-filtering and selectivity benchmarks.
 4. Persist SQ8 and evaluate quantized HNSW.
 5. Implement IVF-PQ only after the HNSW and filtering layers are measured and stable.
