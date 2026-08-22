@@ -10,6 +10,8 @@
 
 # Local tool config
 opencode.json
+HANDOFF.md
+.qwen/
 
 # OS
 .DS_Store
