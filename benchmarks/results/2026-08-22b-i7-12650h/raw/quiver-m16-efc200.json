@@ -1,0 +1,94 @@
+{
+  "engine": "quiver",
+  "engine_version": "0.1.0",
+  "dataset": "SIFT1M",
+  "dimension": 128,
+  "base_vectors": 1000000,
+  "queries": 10000,
+  "thread_count": 1,
+  "random_seed": 42,
+  "m": 16,
+  "ef_construction": 200,
+  "build_seconds": 2052.321361,
+  "baseline_rss_bytes": 15347712,
+  "rss_after_build_bytes": 206032896,
+  "index_rss_delta_bytes": 190685184,
+  "peak_rss_bytes": 734978048,
+  "data_file_bytes": 546308096,
+  "wal_file_bytes": 529000000,
+  "insert_durability": "CRC32 WAL records group-committed (one fsync per batch) before acknowledgment",
+  "search": [
+    {
+      "k": 10,
+      "ef_search": 10,
+      "recall": 0.7690999999999879,
+      "qps": 5182.918944278801,
+      "p50_latency_ms": 0.1088,
+      "p99_latency_ms": 1.3389,
+      "total_seconds": 1.9294147000000001
+    },
+    {
+      "k": 10,
+      "ef_search": 50,
+      "recall": 0.9643399999999729,
+      "qps": 1241.4154261160934,
+      "p50_latency_ms": 0.7665,
+      "p99_latency_ms": 2.0237,
+      "total_seconds": 8.0553212
+    },
+    {
+      "k": 10,
+      "ef_search": 100,
+      "recall": 0.9896099999999884,
+      "qps": 728.9977267590987,
+      "p50_latency_ms": 1.3954,
+      "p99_latency_ms": 2.6732,
+      "total_seconds": 13.7174639
+    },
+    {
+      "k": 10,
+      "ef_search": 200,
+      "recall": 0.9971399999999959,
+      "qps": 456.0275191083283,
+      "p50_latency_ms": 2.2589,
+      "p99_latency_ms": 4.8173,
+      "total_seconds": 21.9285012
+    },
+    {
+      "k": 10,
+      "ef_search": 400,
+      "recall": 0.9989799999999983,
+      "qps": 230.48595608273573,
+      "p50_latency_ms": 4.4881,
+      "p99_latency_ms": 9.1753,
+      "total_seconds": 43.3865914
+    },
+    {
+      "k": 100,
+      "ef_search": 100,
+      "recall": 0.9490599999999401,
+      "qps": 884.4831564246141,
+      "p50_latency_ms": 1.0947,
+      "p99_latency_ms": 2.6913,
+      "total_seconds": 11.3060378
+    },
+    {
+      "k": 100,
+      "ef_search": 200,
+      "recall": 0.9860559999999347,
+      "qps": 429.90568939639815,
+      "p50_latency_ms": 2.3858,
+      "p99_latency_ms": 5.1294,
+      "total_seconds": 23.260915699999998
+    },
+    {
+      "k": 100,
+      "ef_search": 400,
+      "recall": 0.9971349999999708,
+      "qps": 258.8973357424041,
+      "p50_latency_ms": 3.8399,
+      "p99_latency_ms": 8.1412,
+      "total_seconds": 38.6253492
+    }
+  ]
+}

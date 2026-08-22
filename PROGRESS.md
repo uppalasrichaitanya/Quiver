@@ -26,16 +26,18 @@ benchmarks/     reproducible Criterion and SIFT1M comparisons
 - Reproducible SIFT1M comparisons against FAISS and hnswlib, including recall, latency, QPS, and RSS.
 - Axum HTTP API: health, insert, search, and delete. The server opens an existing index or creates one when paths are absent.
 - PyO3 `Index` API and semantic-search demo.
+- HNSW search/build hot-path optimizations (2026-08-22): borrowed-slice `neighbors()`, a thread-local generation-counted visited pool, neighbor prefetch, cached once-per-process SIMD dispatch, four-accumulator AVX2 distance kernels, and group-commit batch WAL inserts.
+- Server concurrency and batching (2026-08-22): `HnswIndex` is shared behind an `RwLock` (parallel reads), and a `POST /search/batch` endpoint runs multiple queries under one read lock.
 
 ## Verification Status
 
-The latest workspace run has **97 tests passing** with zero failures: 96 workspace/unit tests plus the server-process restart persistence integration test. CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing.
+The latest run has **102 `quiver-core` tests** and **4 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence plus the new batch-search endpoint). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing.
 
 ## Known Limitations
 
 - HNSW graph topology is rebuilt on reopen rather than persisted.
-- HNSW mutation is single-writer through `&mut self`; the server wraps it in a mutex.
-- HNSW search has a speed regression versus mature libraries: the packed-adjacency accessor `neighbors()` allocates a `Vec` per call in the beam-search loop, and per-distance overheads remain (runtime SIMD dispatch, per-query `HashSet` visited set, per-candidate cosine norm). Recall and memory are no longer the gap; search QPS (~3x behind FAISS/hnswlib at M=32/efc200) is.
+- HNSW mutation is single-writer through `&mut self`; the server wraps it in an `RwLock` (parallel reads, exclusive writes).
+- HNSW build is slower than in-memory competitors because Quiver fsyncs a CRC32 WAL during the build, while FAISS/hnswlib build in memory and serialize afterward. Group-commit batch inserts (2026-08-22) cut build time ~2-2.7x, but the durability-during-build cost remains the gap. Search speed and recall are no longer the gap: at M=32/efc200/ef=100 Quiver now measures 2680 QPS / p50 0.38 ms / Recall@10 0.9961, on par with or above FAISS and hnswlib.
 - SQ8 is in-memory and batch-built; online recalibration and persistence are not implemented.
 - Metadata/filtering and IVF-PQ are not implemented.
 - Crates.io and PyPI releases are not published.
@@ -52,7 +54,7 @@ $env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "
 
 1. Complete project hygiene and API lifecycle (done).
 2. HNSW diversified neighbor selection and packed 32-bit fixed-capacity adjacency are implemented and covered by unit/regression tests. The same-host SIFT1M rerun is **complete** (2026-08-22): recall at M=32/efc200/ef=100 rose 0.9595 -> 0.9961 (now above FAISS 0.9922 and hnswlib 0.9920), peak RSS fell 3.4x, build is ~1.0-1.5x slower, and search QPS regressed to ~0.77x of the July baseline. Raw JSON in `benchmarks/results/2026-08-22-i7-12650h/raw`.
-3. Close the search-speed gap: make `neighbors()` return a borrowed slice (no per-call allocation), resolve SIMD dispatch once per index, replace the per-query `HashSet` visited set with a generation-counted pool, and hoist the cosine query norm. Re-measure with the same SIFT1M harness.
+3. Closed the search-speed gap (done, 2026-08-22): `neighbors()` returns a borrowed slice, SIMD dispatch resolves once per process, the visited set is a generation-counted pool, neighbor vectors are prefetched, AVX2 kernels use four accumulators, and inserts batch into one WAL fsync per group. Re-measured on the same SIFT1M harness: at M=32/efc200/ef=100 search is now 2680 QPS / p50 0.38 ms (3.4x the July baseline, on par with FAISS/hnswlib) and build is 2.06-2.68x faster, with bit-identical recall. Raw JSON in `benchmarks/results/2026-08-22b-i7-12650h/raw` and `.../2026-08-22c-i7-12650h/raw` (the latter a cool-down rerun of the two efc=200 configs).
 4. Add metadata and filtered search, starting with post-filtering and selectivity benchmarks.
 5. Persist SQ8 and evaluate quantized HNSW.
 6. Implement IVF-PQ only after the HNSW and filtering layers are measured and stable.
