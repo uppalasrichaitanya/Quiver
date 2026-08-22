@@ -8,6 +8,9 @@
 *.swp
 *.swo
 
+# Local tool config
+opencode.json
+
 # OS
 .DS_Store
 Thumbs.db
