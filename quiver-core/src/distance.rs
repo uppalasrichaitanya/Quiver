@@ -6,8 +6,11 @@
 //! # SIMD Support
 //!
 //! On x86_64 CPUs with AVX2+FMA support, the distance functions automatically
-//! dispatch to SIMD kernels that process 8 floats per cycle. Runtime feature
-//! detection ensures correct fallback to scalar code on older hardware.
+//! dispatch to SIMD kernels that process 32 floats per loop iteration using
+//! four independent 256-bit accumulators (breaking the FMA dependency chain).
+//! Runtime feature detection is cached once per process, ensuring correct
+//! fallback to scalar code on older hardware without per-call detection
+//! overhead.
 //!
 //! # Design Note
 //!
@@ -97,38 +100,59 @@ mod avx2 {
 
     /// AVX2+FMA optimized L2 squared distance.
     ///
-    /// Processes 8 floats per iteration using 256-bit SIMD registers.
-    /// Handles the tail (dimensions not divisible by 8) with scalar code.
+    /// Processes 32 floats per iteration using four independent 256-bit
+    /// accumulators, which breaks the FMA dependency chain and lets the CPU
+    /// overlap iterations. Handles the tail (dimensions not divisible by 32)
+    /// with scalar code.
     ///
     /// # Safety
-    /// Caller must ensure AVX2 and FMA are available (use `is_x86_feature_detected!`).
+    /// Caller must ensure AVX2 and FMA are available (see `simd_enabled()`).
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn l2_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
         let n = a.len();
-        let chunks = n / 8;
-        let remainder = n % 8;
+        let chunks = n / 32;
+        let remainder = n % 32;
 
         // SAFETY: caller guarantees AVX2+FMA are available
-        let mut sum = _mm256_setzero_ps();
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut sum2 = _mm256_setzero_ps();
+        let mut sum3 = _mm256_setzero_ps();
 
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
         for i in 0..chunks {
-            let offset = i * 8;
+            let offset = i * 32;
             unsafe {
-                let va = _mm256_loadu_ps(a_ptr.add(offset));
-                let vb = _mm256_loadu_ps(b_ptr.add(offset));
-                let diff = _mm256_sub_ps(va, vb);
-                sum = _mm256_fmadd_ps(diff, diff, sum);
+                let va0 = _mm256_loadu_ps(a_ptr.add(offset));
+                let vb0 = _mm256_loadu_ps(b_ptr.add(offset));
+                let va1 = _mm256_loadu_ps(a_ptr.add(offset + 8));
+                let vb1 = _mm256_loadu_ps(b_ptr.add(offset + 8));
+                let va2 = _mm256_loadu_ps(a_ptr.add(offset + 16));
+                let vb2 = _mm256_loadu_ps(b_ptr.add(offset + 16));
+                let va3 = _mm256_loadu_ps(a_ptr.add(offset + 24));
+                let vb3 = _mm256_loadu_ps(b_ptr.add(offset + 24));
+
+                let diff0 = _mm256_sub_ps(va0, vb0);
+                let diff1 = _mm256_sub_ps(va1, vb1);
+                let diff2 = _mm256_sub_ps(va2, vb2);
+                let diff3 = _mm256_sub_ps(va3, vb3);
+
+                sum0 = _mm256_fmadd_ps(diff0, diff0, sum0);
+                sum1 = _mm256_fmadd_ps(diff1, diff1, sum1);
+                sum2 = _mm256_fmadd_ps(diff2, diff2, sum2);
+                sum3 = _mm256_fmadd_ps(diff3, diff3, sum3);
             }
         }
 
+        // Combine the four independent accumulators, then reduce.
+        let sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
         let mut result = unsafe { hsum256_ps(sum) };
 
         // Scalar tail
-        let tail_start = chunks * 8;
+        let tail_start = chunks * 32;
         for i in 0..remainder {
             let diff = a[tail_start + i] - b[tail_start + i];
             result += diff * diff;
@@ -139,33 +163,53 @@ mod avx2 {
 
     /// AVX2+FMA optimized dot product.
     ///
+    /// Processes 32 floats per iteration using four independent 256-bit
+    /// accumulators, which breaks the FMA dependency chain and lets the CPU
+    /// overlap iterations. Handles the tail (dimensions not divisible by 32)
+    /// with scalar code.
+    ///
     /// # Safety
     /// Caller must ensure AVX2 and FMA are available.
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
         let n = a.len();
-        let chunks = n / 8;
-        let remainder = n % 8;
+        let chunks = n / 32;
+        let remainder = n % 32;
 
-        let mut sum = _mm256_setzero_ps();
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut sum2 = _mm256_setzero_ps();
+        let mut sum3 = _mm256_setzero_ps();
 
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
         for i in 0..chunks {
-            let offset = i * 8;
+            let offset = i * 32;
             unsafe {
-                let va = _mm256_loadu_ps(a_ptr.add(offset));
-                let vb = _mm256_loadu_ps(b_ptr.add(offset));
-                sum = _mm256_fmadd_ps(va, vb, sum);
+                let va0 = _mm256_loadu_ps(a_ptr.add(offset));
+                let vb0 = _mm256_loadu_ps(b_ptr.add(offset));
+                let va1 = _mm256_loadu_ps(a_ptr.add(offset + 8));
+                let vb1 = _mm256_loadu_ps(b_ptr.add(offset + 8));
+                let va2 = _mm256_loadu_ps(a_ptr.add(offset + 16));
+                let vb2 = _mm256_loadu_ps(b_ptr.add(offset + 16));
+                let va3 = _mm256_loadu_ps(a_ptr.add(offset + 24));
+                let vb3 = _mm256_loadu_ps(b_ptr.add(offset + 24));
+
+                sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
+                sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
+                sum2 = _mm256_fmadd_ps(va2, vb2, sum2);
+                sum3 = _mm256_fmadd_ps(va3, vb3, sum3);
             }
         }
 
+        // Combine the four independent accumulators, then reduce.
+        let sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
         let mut result = unsafe { hsum256_ps(sum) };
 
         // Scalar tail
-        let tail_start = chunks * 8;
+        let tail_start = chunks * 32;
         for i in 0..remainder {
             result += a[tail_start + i] * b[tail_start + i];
         }
@@ -176,7 +220,9 @@ mod avx2 {
     /// AVX2+FMA optimized cosine similarity.
     ///
     /// Computes dot product and both norms in a single pass over the data,
-    /// minimizing cache misses.
+    /// minimizing cache misses. Each of the three running sums uses four
+    /// independent 256-bit accumulators (32 floats per iteration), breaking
+    /// every FMA dependency chain so the CPU can overlap iterations.
     ///
     /// # Safety
     /// Caller must ensure AVX2 and FMA are available.
@@ -184,33 +230,74 @@ mod avx2 {
     pub unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
         let n = a.len();
-        let chunks = n / 8;
-        let remainder = n % 8;
+        let chunks = n / 32;
+        let remainder = n % 32;
 
-        let mut dot_acc = _mm256_setzero_ps();
-        let mut norm_a_acc = _mm256_setzero_ps();
-        let mut norm_b_acc = _mm256_setzero_ps();
+        let mut dot_acc0 = _mm256_setzero_ps();
+        let mut dot_acc1 = _mm256_setzero_ps();
+        let mut dot_acc2 = _mm256_setzero_ps();
+        let mut dot_acc3 = _mm256_setzero_ps();
+        let mut norm_a_acc0 = _mm256_setzero_ps();
+        let mut norm_a_acc1 = _mm256_setzero_ps();
+        let mut norm_a_acc2 = _mm256_setzero_ps();
+        let mut norm_a_acc3 = _mm256_setzero_ps();
+        let mut norm_b_acc0 = _mm256_setzero_ps();
+        let mut norm_b_acc1 = _mm256_setzero_ps();
+        let mut norm_b_acc2 = _mm256_setzero_ps();
+        let mut norm_b_acc3 = _mm256_setzero_ps();
 
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
 
         for i in 0..chunks {
-            let offset = i * 8;
+            let offset = i * 32;
             unsafe {
-                let va = _mm256_loadu_ps(a_ptr.add(offset));
-                let vb = _mm256_loadu_ps(b_ptr.add(offset));
-                dot_acc = _mm256_fmadd_ps(va, vb, dot_acc);
-                norm_a_acc = _mm256_fmadd_ps(va, va, norm_a_acc);
-                norm_b_acc = _mm256_fmadd_ps(vb, vb, norm_b_acc);
+                let va0 = _mm256_loadu_ps(a_ptr.add(offset));
+                let vb0 = _mm256_loadu_ps(b_ptr.add(offset));
+                let va1 = _mm256_loadu_ps(a_ptr.add(offset + 8));
+                let vb1 = _mm256_loadu_ps(b_ptr.add(offset + 8));
+                let va2 = _mm256_loadu_ps(a_ptr.add(offset + 16));
+                let vb2 = _mm256_loadu_ps(b_ptr.add(offset + 16));
+                let va3 = _mm256_loadu_ps(a_ptr.add(offset + 24));
+                let vb3 = _mm256_loadu_ps(b_ptr.add(offset + 24));
+
+                dot_acc0 = _mm256_fmadd_ps(va0, vb0, dot_acc0);
+                dot_acc1 = _mm256_fmadd_ps(va1, vb1, dot_acc1);
+                dot_acc2 = _mm256_fmadd_ps(va2, vb2, dot_acc2);
+                dot_acc3 = _mm256_fmadd_ps(va3, vb3, dot_acc3);
+
+                norm_a_acc0 = _mm256_fmadd_ps(va0, va0, norm_a_acc0);
+                norm_a_acc1 = _mm256_fmadd_ps(va1, va1, norm_a_acc1);
+                norm_a_acc2 = _mm256_fmadd_ps(va2, va2, norm_a_acc2);
+                norm_a_acc3 = _mm256_fmadd_ps(va3, va3, norm_a_acc3);
+
+                norm_b_acc0 = _mm256_fmadd_ps(vb0, vb0, norm_b_acc0);
+                norm_b_acc1 = _mm256_fmadd_ps(vb1, vb1, norm_b_acc1);
+                norm_b_acc2 = _mm256_fmadd_ps(vb2, vb2, norm_b_acc2);
+                norm_b_acc3 = _mm256_fmadd_ps(vb3, vb3, norm_b_acc3);
             }
         }
 
-        let mut dot = unsafe { hsum256_ps(dot_acc) };
-        let mut norm_a = unsafe { hsum256_ps(norm_a_acc) };
-        let mut norm_b = unsafe { hsum256_ps(norm_b_acc) };
+        // Combine each set of four accumulators, then reduce.
+        let dot_sum = _mm256_add_ps(
+            _mm256_add_ps(dot_acc0, dot_acc1),
+            _mm256_add_ps(dot_acc2, dot_acc3),
+        );
+        let norm_a_sum = _mm256_add_ps(
+            _mm256_add_ps(norm_a_acc0, norm_a_acc1),
+            _mm256_add_ps(norm_a_acc2, norm_a_acc3),
+        );
+        let norm_b_sum = _mm256_add_ps(
+            _mm256_add_ps(norm_b_acc0, norm_b_acc1),
+            _mm256_add_ps(norm_b_acc2, norm_b_acc3),
+        );
+
+        let mut dot = unsafe { hsum256_ps(dot_sum) };
+        let mut norm_a = unsafe { hsum256_ps(norm_a_sum) };
+        let mut norm_b = unsafe { hsum256_ps(norm_b_sum) };
 
         // Scalar tail
-        let tail_start = chunks * 8;
+        let tail_start = chunks * 32;
         for i in 0..remainder {
             let x = a[tail_start + i];
             let y = b[tail_start + i];
@@ -249,6 +336,32 @@ mod avx2 {
 
 // ── Dispatching public API ──────────────────────────────────────────────────
 
+/// Cached AVX2+FMA feature detection, computed once per process.
+///
+/// `is_x86_feature_detected!` is too expensive to run on every distance call
+/// (HNSW search invokes these functions millions of times per query batch),
+/// so the detection result is computed once and reused for the lifetime of
+/// the process. CPU features cannot change mid-process, so caching is sound.
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+#[inline]
+fn simd_enabled() -> bool {
+    use std::sync::LazyLock;
+
+    static SIMD_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    });
+
+    *SIMD_ENABLED
+}
+
+/// SIMD dispatch is compiled out on non-x86_64 targets and when the
+/// `force-scalar` feature is enabled.
+#[cfg(any(not(target_arch = "x86_64"), feature = "force-scalar"))]
+#[inline]
+fn simd_enabled() -> bool {
+    false
+}
+
 /// Compute the squared L2 (Euclidean) distance between two vectors.
 ///
 /// Automatically dispatches to AVX2+FMA if available, otherwise falls back to scalar.
@@ -256,8 +369,9 @@ mod avx2 {
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // SAFETY: We just verified AVX2+FMA are available.
+        if simd_enabled() {
+            // SAFETY: `simd_enabled()` only returns true when AVX2+FMA were
+            // detected at runtime.
             return unsafe { avx2::l2_squared_avx2(a, b) };
         }
     }
@@ -271,7 +385,9 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if simd_enabled() {
+            // SAFETY: `simd_enabled()` only returns true when AVX2+FMA were
+            // detected at runtime.
             return unsafe { avx2::dot_product_avx2(a, b) };
         }
     }
@@ -289,7 +405,9 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if simd_enabled() {
+            // SAFETY: `simd_enabled()` only returns true when AVX2+FMA were
+            // detected at runtime.
             return unsafe { avx2::cosine_similarity_avx2(a, b) };
         }
     }
@@ -312,15 +430,11 @@ pub fn compute_distance(a: &[f32], b: &[f32], metric: Metric) -> f32 {
 }
 
 /// Check whether AVX2+FMA SIMD acceleration is available on this CPU.
+///
+/// Returns the cached process-lifetime detection result, so it is cheap to
+/// call repeatedly.
 pub fn simd_available() -> bool {
-    #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
-    {
-        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
-    }
-    #[cfg(any(not(target_arch = "x86_64"), feature = "force-scalar"))]
-    {
-        false
-    }
+    simd_enabled()
 }
 
 #[cfg(test)]
