@@ -18,7 +18,7 @@
 //! provide an internal synchronization wrapper. Concurrent access is a future API concern.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::path::Path;
 
 use rand::rngs::StdRng;
@@ -81,6 +81,11 @@ impl Default for HnswConfig {
 }
 
 /// A node in the HNSW graph.
+///
+/// Level metadata lives in the shared [`HnswIndex::level_blocks`] arena: this
+/// node's `max_layer + 1` blocks start at `levels_offset`. Packing every node's
+/// level list into one arena avoids a per-node heap allocation (one small `Vec`
+/// per node) and keeps level metadata contiguous.
 #[derive(Debug, Clone)]
 struct HnswNode {
     /// The slot index of this vector in the VectorStore.
@@ -89,22 +94,25 @@ struct HnswNode {
     vector_id: u64,
     /// The maximum layer this node belongs to (0-indexed).
     max_layer: usize,
-    /// Neighbor lists for each layer. neighbors[l] contains the neighbor node indices
-    /// (indices into HnswIndex::nodes, not slot indices).
-    levels: Vec<LevelBlock>,
+    /// Offset of this node's first `LevelBlock` in the shared arena.
+    levels_offset: u32,
     /// Whether this node has been deleted (tombstone).
     deleted: bool,
 }
 
+/// One layer's neighbor-list location within the packed adjacency arena.
+///
+/// `u32` fields are sufficient: offsets index a `Vec<u32>` adjacency arena and
+/// lengths/capacities are bounded by `m_max0`, all far below `u32::MAX`.
 #[derive(Debug, Clone, Copy)]
 struct LevelBlock {
-    offset: usize,
-    len: usize,
-    capacity: usize,
+    offset: u32,
+    len: u32,
+    capacity: u32,
 }
 
 /// A candidate during search: node index + distance.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Candidate {
     node_idx: usize,
     distance: f32,
@@ -126,6 +134,55 @@ impl Ord for Candidate {
     }
 }
 
+/// Generation-stamped visited set reused across searches on the same thread.
+///
+/// Replaces the per-query `HashSet`: each search bumps a generation counter and
+/// stamps visited node indices with it, so membership is a single array load
+/// and there is no hashing or per-query allocation. Kept thread-local so the
+/// index itself stays `Sync` (search takes `&self`).
+struct VisitedPool {
+    marks: Vec<u32>,
+    generation: u32,
+}
+
+impl VisitedPool {
+    fn new() -> Self {
+        Self {
+            marks: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    /// Prepare for a new search over `n` nodes.
+    fn begin(&mut self, n: usize) {
+        if self.marks.len() < n {
+            self.marks.resize(n, 0);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Wrapped around — clear all marks and resume from generation 1.
+            self.marks.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    /// Mark `idx` visited. Returns true if it was not yet visited this search.
+    #[inline]
+    fn visit(&mut self, idx: usize) -> bool {
+        if self.marks[idx] == self.generation {
+            false
+        } else {
+            self.marks[idx] = self.generation;
+            true
+        }
+    }
+}
+
+thread_local! {
+    static VISITED_POOL: std::cell::RefCell<VisitedPool> =
+        std::cell::RefCell::new(VisitedPool::new());
+}
+
 /// The HNSW index.
 pub struct HnswIndex {
     /// The underlying vector storage.
@@ -134,6 +191,9 @@ pub struct HnswIndex {
     nodes: Vec<HnswNode>,
     /// Fixed-capacity adjacency blocks containing 32-bit node IDs.
     adjacency_links: Vec<u32>,
+    /// Packed per-node level metadata. Node `i` owns the contiguous range
+    /// `levels_offset .. levels_offset + max_layer + 1` in this arena.
+    level_blocks: Vec<LevelBlock>,
     /// Index of the current entry point node (topmost layer).
     entry_point: Option<usize>,
     /// Maximum layer currently in the graph.
@@ -161,6 +221,7 @@ impl HnswIndex {
             store,
             nodes: Vec::new(),
             adjacency_links: Vec::new(),
+            level_blocks: Vec::new(),
             entry_point: None,
             max_level: 0,
             config,
@@ -184,6 +245,7 @@ impl HnswIndex {
             store,
             nodes: Vec::new(),
             adjacency_links: Vec::new(),
+            level_blocks: Vec::new(),
             entry_point: None,
             max_level: 0,
             config,
@@ -233,6 +295,24 @@ impl HnswIndex {
         Ok(vector_id)
     }
 
+    /// Insert a batch of vectors.
+    ///
+    /// Storage is made durable with a single group-committed WAL fsync for the
+    /// whole batch (see [`VectorStore::insert_batch`]); graph insertion remains
+    /// sequential because each insert depends on the prior graph state. Returns
+    /// the assigned vector IDs in input order.
+    pub fn insert_batch(&mut self, batch: &[&[f32]]) -> Result<Vec<u64>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.store.insert_batch(batch)?;
+        let base_slot = self.store.len() - ids.len();
+        for (i, vector) in batch.iter().enumerate() {
+            self.insert_into_graph(base_slot + i, ids[i], vector);
+        }
+        Ok(ids)
+    }
+
     /// Search for the `k` nearest neighbors of the query vector.
     ///
     /// `ef_search` controls the size of the dynamic candidate list. Higher values
@@ -256,19 +336,24 @@ impl HnswIndex {
         let mut current = entry_point;
         let metric = self.store.metric();
 
-        let ep_vector = self.store.get_vector(self.nodes[current].slot)?;
+        let ep_vector = self.store.get_vector_unchecked(self.nodes[current].slot);
         let mut current_dist = compute_distance(query, ep_vector, metric);
 
         for level in (1..=self.max_level).rev() {
             let mut changed = true;
             while changed {
                 changed = false;
+                if level > self.nodes[current].max_layer {
+                    break;
+                }
                 let neighbors = self.neighbors(current, level);
-                for neighbor_idx in neighbors {
+                for &neighbor_link in neighbors {
+                    let neighbor_idx = neighbor_link as usize;
                     if self.nodes[neighbor_idx].deleted {
                         continue;
                     }
-                    let neighbor_vec = self.store.get_vector(self.nodes[neighbor_idx].slot)?;
+                    let neighbor_vec =
+                        self.store.get_vector_unchecked(self.nodes[neighbor_idx].slot);
                     let dist = compute_distance(query, neighbor_vec, metric);
                     if dist < current_dist {
                         current = neighbor_idx;
@@ -280,7 +365,7 @@ impl HnswIndex {
         }
 
         // Phase 2: Beam search at layer 0 with ef candidates
-        let candidates = self.search_layer(query, current, ef, 0, metric)?;
+        let candidates = self.search_layer(query, current, ef, 0, metric);
 
         // Take top-k results
         let mut results: Vec<SearchResult> = candidates
@@ -357,6 +442,7 @@ impl HnswIndex {
         self.store.compact()?;
         self.nodes.clear();
         self.adjacency_links.clear();
+        self.level_blocks.clear();
         self.entry_point = None;
         self.max_level = 0;
         self.tombstone_count = 0;
@@ -393,28 +479,45 @@ impl HnswIndex {
         (-r.ln() * self.config.ml).floor() as usize
     }
 
-    fn neighbors(&self, node_idx: usize, level: usize) -> Vec<usize> {
-        let block = self.nodes[node_idx].levels[level];
-        self.adjacency_links[block.offset..block.offset + block.len]
-            .iter()
-            .map(|&link| link as usize)
-            .collect()
+    /// Borrow the neighbor list for a node at a layer.
+    ///
+    /// Returns a slice into the packed adjacency arena — no allocation. Callers
+    /// cast each `u32` link to `usize` when indexing `nodes`.
+    #[inline]
+    fn neighbors(&self, node_idx: usize, level: usize) -> &[u32] {
+        let block = self.level_block(node_idx, level);
+        let start = block.offset as usize;
+        &self.adjacency_links[start..start + block.len as usize]
+    }
+
+    /// Read a node's level metadata from the packed arena.
+    #[inline]
+    fn level_block(&self, node_idx: usize, level: usize) -> LevelBlock {
+        let node = &self.nodes[node_idx];
+        self.level_blocks[node.levels_offset as usize + level]
+    }
+
+    /// Write a node's level metadata back into the packed arena.
+    #[inline]
+    fn set_level_block_len(&mut self, node_idx: usize, level: usize, len: u32) {
+        let offset = self.nodes[node_idx].levels_offset as usize + level;
+        self.level_blocks[offset].len = len;
     }
 
     fn replace_neighbors(&mut self, node_idx: usize, level: usize, neighbors: &[usize]) {
-        let block = self.nodes[node_idx].levels[level];
+        let block = self.level_block(node_idx, level);
         assert!(
-            neighbors.len() <= block.capacity,
+            neighbors.len() <= block.capacity as usize,
             "neighbor list exceeds fixed capacity"
         );
-        for (slot, &neighbor_idx) in self.adjacency_links
-            [block.offset..block.offset + neighbors.len()]
+        let start = block.offset as usize;
+        for (slot, &neighbor_idx) in self.adjacency_links[start..start + neighbors.len()]
             .iter_mut()
             .zip(neighbors)
         {
             *slot = u32::try_from(neighbor_idx).expect("node index exceeds u32 capacity");
         }
-        self.nodes[node_idx].levels[level].len = neighbors.len();
+        self.set_level_block_len(node_idx, level, neighbors.len() as u32);
     }
 
     /// Insert a vector into the HNSW graph (assumes it's already in the store).
@@ -425,22 +528,25 @@ impl HnswIndex {
         // Create the new node
         let m_max0 = self.config.m_max0;
         let m = self.config.m;
-        let mut levels = Vec::with_capacity(new_level + 1);
+        let levels_offset = u32::try_from(self.level_blocks.len())
+            .expect("level block arena exceeds u32 capacity");
         for level in 0..=new_level {
             let capacity = if level == 0 { m_max0 } else { m };
-            let offset = self.adjacency_links.len();
-            self.adjacency_links.resize(offset + capacity, 0);
-            levels.push(LevelBlock {
+            let offset = u32::try_from(self.adjacency_links.len())
+                .expect("adjacency arena exceeds u32 capacity");
+            self.adjacency_links
+                .resize(offset as usize + capacity, 0);
+            self.level_blocks.push(LevelBlock {
                 offset,
                 len: 0,
-                capacity,
+                capacity: capacity as u32,
             });
         }
         let new_node = HnswNode {
             slot,
             vector_id,
             max_layer: new_level,
-            levels,
+            levels_offset,
             deleted: false,
         };
         let new_node_idx = self.nodes.len();
@@ -457,10 +563,7 @@ impl HnswIndex {
         let mut current = entry_point;
 
         // Compute distance from the new vector to the current entry point
-        let ep_vec = match self.store.get_vector(self.nodes[current].slot) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        let ep_vec = self.store.get_vector_unchecked(self.nodes[current].slot);
         let mut current_dist = compute_distance(vector, ep_vec, metric);
 
         // Phase 1: Greedy descent through layers above the new node's level
@@ -468,17 +571,13 @@ impl HnswIndex {
             let mut changed = true;
             while changed {
                 changed = false;
-                // Clone the neighbor list to avoid borrow conflict
-                let neighbors: Vec<usize> = if level <= self.nodes[current].max_layer {
-                    self.neighbors(current, level)
-                } else {
-                    Vec::new()
-                };
-                for neighbor_idx in neighbors {
-                    let n_vec = match self.store.get_vector(self.nodes[neighbor_idx].slot) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                if level > self.nodes[current].max_layer {
+                    continue;
+                }
+                let neighbors = self.neighbors(current, level);
+                for &neighbor_link in neighbors {
+                    let neighbor_idx = neighbor_link as usize;
+                    let n_vec = self.store.get_vector_unchecked(self.nodes[neighbor_idx].slot);
                     let dist = compute_distance(vector, n_vec, metric);
                     if dist < current_dist {
                         current = neighbor_idx;
@@ -493,11 +592,7 @@ impl HnswIndex {
         let insert_from = new_level.min(self.max_level);
         for level in (0..=insert_from).rev() {
             let ef = self.config.ef_construction;
-            let candidates = match self.search_layer_for_insert(vector, current, ef, level, metric)
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            let candidates = self.search_layer_for_insert(vector, current, ef, level, metric);
 
             let m_level = if level == 0 { m_max0 } else { m };
             let candidates: Vec<Candidate> = candidates
@@ -513,7 +608,10 @@ impl HnswIndex {
             for &neighbor_idx in &selected {
                 if level <= self.nodes[neighbor_idx].max_layer {
                     let max_conn = if level == 0 { m_max0 } else { m };
-                    let mut reverse_neighbors = self.neighbors(neighbor_idx, level);
+                    let existing = self.neighbors(neighbor_idx, level);
+                    let mut reverse_neighbors: Vec<usize> =
+                        Vec::with_capacity(existing.len() + 1);
+                    reverse_neighbors.extend(existing.iter().map(|&link| link as usize));
                     reverse_neighbors.push(new_node_idx);
                     if reverse_neighbors.len() > max_conn {
                         self.prune_connections(
@@ -550,12 +648,27 @@ impl HnswIndex {
         ef: usize,
         level: usize,
         metric: Metric,
-    ) -> Result<Vec<Candidate>> {
-        let ep_vec = self.store.get_vector(self.nodes[entry_point].slot)?;
+    ) -> Vec<Candidate> {
+        VISITED_POOL.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            pool.begin(self.nodes.len());
+            self.search_layer_inner(query, entry_point, ef, level, metric, &mut pool)
+        })
+    }
+
+    fn search_layer_inner(
+        &self,
+        query: &[f32],
+        entry_point: usize,
+        ef: usize,
+        level: usize,
+        metric: Metric,
+        pool: &mut VisitedPool,
+    ) -> Vec<Candidate> {
+        let ep_vec = self.store.get_vector_unchecked(self.nodes[entry_point].slot);
         let ep_dist = compute_distance(query, ep_vec, metric);
 
-        let mut visited = HashSet::new();
-        visited.insert(entry_point);
+        pool.visit(entry_point);
 
         // Min-heap: closest candidates to explore
         let mut candidates: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
@@ -578,19 +691,25 @@ impl HnswIndex {
                 break;
             }
 
-            // Explore neighbors
-            let neighbors = if level <= self.nodes[current.node_idx].max_layer {
-                self.neighbors(current.node_idx, level)
-            } else {
+            if level > self.nodes[current.node_idx].max_layer {
                 continue;
-            };
+            }
+            let neighbors = self.neighbors(current.node_idx, level);
 
-            for neighbor_idx in neighbors {
-                if !visited.insert(neighbor_idx) {
+            for (i, &neighbor_link) in neighbors.iter().enumerate() {
+                let neighbor_idx = neighbor_link as usize;
+
+                // Prefetch the next neighbor's vector while we process this one.
+                if let Some(&next_link) = neighbors.get(i + 1) {
+                    self.store
+                        .prefetch_vector(self.nodes[next_link as usize].slot);
+                }
+
+                if !pool.visit(neighbor_idx) {
                     continue;
                 }
 
-                let n_vec = self.store.get_vector(self.nodes[neighbor_idx].slot)?;
+                let n_vec = self.store.get_vector_unchecked(self.nodes[neighbor_idx].slot);
                 let dist = compute_distance(query, n_vec, metric);
                 let worst_dist = results.peek().map(|c| c.distance).unwrap_or(f32::MAX);
 
@@ -613,11 +732,10 @@ impl HnswIndex {
         // Convert to sorted vec (closest first)
         let mut sorted: Vec<Candidate> = results.into_vec();
         sorted.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        Ok(sorted)
+        sorted
     }
 
-    /// Search layer for insertion — same as search_layer but without the Result overhead
-    /// for the internal insert path.
+    /// Search layer for insertion — same beam search used during construction.
     fn search_layer_for_insert(
         &self,
         query: &[f32],
@@ -625,7 +743,7 @@ impl HnswIndex {
         ef: usize,
         level: usize,
         metric: Metric,
-    ) -> Result<Vec<Candidate>> {
+    ) -> Vec<Candidate> {
         self.search_layer(query, entry_point, ef, level, metric)
     }
 
@@ -643,17 +761,15 @@ impl HnswIndex {
         let mut discarded: Vec<usize> = Vec::new();
 
         for candidate in candidates {
-            let candidate_vec = match self.store.get_vector(self.nodes[candidate.node_idx].slot) {
-                Ok(vector) => vector,
-                Err(_) => continue,
-            };
+            // Slots come from live graph nodes, so unchecked access is safe here.
+            let candidate_vec = self
+                .store
+                .get_vector_unchecked(self.nodes[candidate.node_idx].slot);
             let diverse = selected.iter().all(|&selected_idx| {
-                self.store
-                    .get_vector(self.nodes[selected_idx].slot)
-                    .map(|selected_vec| {
-                        compute_distance(candidate_vec, selected_vec, metric) >= candidate.distance
-                    })
-                    .unwrap_or(false)
+                let selected_vec = self
+                    .store
+                    .get_vector_unchecked(self.nodes[selected_idx].slot);
+                compute_distance(candidate_vec, selected_vec, metric) >= candidate.distance
             });
             if diverse && selected.len() < max_connections {
                 selected.push(candidate.node_idx);
@@ -682,25 +798,23 @@ impl HnswIndex {
         metric: Metric,
     ) {
         let node_slot = self.nodes[node_idx].slot;
-        let node_vec = match self.store.get_vector(node_slot) {
-            Ok(v) => v.to_vec(),
-            Err(_) => return,
-        };
+        // Slots come from live graph nodes, so unchecked access is safe here.
+        let node_vec = self.store.get_vector_unchecked(node_slot);
 
         let mut candidates: Vec<Candidate> = neighbors
             .iter()
             .copied()
-            .filter_map(|n_idx| {
-                let n_vec = self.store.get_vector(self.nodes[n_idx].slot).ok()?;
-                let dist = compute_distance(&node_vec, n_vec, metric);
-                Some(Candidate {
+            .map(|n_idx| {
+                let n_vec = self.store.get_vector_unchecked(self.nodes[n_idx].slot);
+                let dist = compute_distance(node_vec, n_vec, metric);
+                Candidate {
                     node_idx: n_idx,
                     distance: dist,
-                })
+                }
             })
             .collect();
         candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        let selected = self.select_neighbors_heuristic(&node_vec, &candidates, max_conn, metric);
+        let selected = self.select_neighbors_heuristic(node_vec, &candidates, max_conn, metric);
         self.replace_neighbors(node_idx, level, &selected);
     }
 }
@@ -708,6 +822,7 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn setup(dim: u32, metric: Metric, m: usize) -> (TempDir, HnswIndex) {
@@ -746,6 +861,33 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_batch_matches_single_insert() {
+        let (_dir, mut index) = setup(3, Metric::L2, 8);
+        let vectors: Vec<Vec<f32>> = (0..50)
+            .map(|i| vec![i as f32, (i % 7) as f32, 0.0])
+            .collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let ids = index.insert_batch(&refs).unwrap();
+        assert_eq!(ids.len(), 50);
+        assert_eq!(index.len(), 50);
+        // IDs are sequential starting at 1.
+        assert_eq!(ids.first().copied(), Some(1));
+        assert_eq!(ids.last().copied(), Some(50));
+        // The batch-built graph must be searchable with good recall.
+        let results = index.search(&[25.0, 4.0, 0.0], 5, 50).unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].vector_id, 26); // vector index 25 -> id 26
+    }
+
+    #[test]
+    fn test_insert_batch_empty() {
+        let (_dir, mut index) = setup(3, Metric::L2, 4);
+        let ids = index.insert_batch(&[]).unwrap();
+        assert!(ids.is_empty());
+        assert!(index.is_empty());
+    }
+
+    #[test]
     fn diversified_selection_keeps_a_farther_bridge_candidate() {
         let (_dir, mut index) = setup(1, Metric::L2, 4);
         index.insert(&[1.0]).unwrap();
@@ -778,8 +920,10 @@ mod tests {
         index.insert(&[0.0, 0.0]).unwrap();
 
         let node = &index.nodes[0];
-        assert_eq!(node.levels.len(), node.max_layer + 1);
-        assert_eq!(node.levels[0].capacity, index.config.m_max0);
+        let blocks = &index.level_blocks
+            [node.levels_offset as usize..node.levels_offset as usize + node.max_layer + 1];
+        assert_eq!(blocks.len(), node.max_layer + 1);
+        assert_eq!(blocks[0].capacity as usize, index.config.m_max0);
         assert_eq!(index.adjacency_links.len(), index.config.m_max0);
         assert_eq!(std::mem::size_of_val(&index.adjacency_links[0]), 4);
     }
@@ -958,8 +1102,9 @@ mod tests {
 
         // Verify all nodes have valid neighbor references
         for (idx, node) in index.nodes.iter().enumerate() {
-            for level in 0..node.levels.len() {
-                for neighbor_idx in index.neighbors(idx, level) {
+            for level in 0..=node.max_layer {
+                for &neighbor_link in index.neighbors(idx, level) {
+                    let neighbor_idx = neighbor_link as usize;
                     assert!(
                         neighbor_idx < index.nodes.len(),
                         "Node {idx} at level {level} has invalid neighbor {neighbor_idx}"

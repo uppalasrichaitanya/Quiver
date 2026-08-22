@@ -211,6 +211,48 @@ impl VectorStore {
         Ok(vector_id)
     }
 
+    /// Insert a batch of vectors with a single WAL fsync (group commit).
+    ///
+    /// All vectors are validated first, then logged to the WAL and made durable
+    /// with one fsync for the whole batch, then written to the mmap. This
+    /// amortizes the per-insert fsync cost for bulk ingestion while preserving
+    /// the durability guarantee — the entire batch is durable before returning,
+    /// and a crash mid-batch replays exactly the durable prefix.
+    pub fn insert_batch(&mut self, batch: &[&[f32]]) -> Result<Vec<u64>> {
+        // Validate every dimension up front so a bad vector cannot partially commit.
+        for data in batch {
+            if data.len() != self.header.dimension as usize {
+                return Err(QuiverError::DimensionMismatch {
+                    expected: self.header.dimension,
+                    actual: data.len() as u32,
+                });
+            }
+        }
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let base = self.header.max_vector_id;
+        let wal = self.wal.as_mut().expect("vector store WAL is open");
+        let mut ids = Vec::with_capacity(batch.len());
+        for (i, data) in batch.iter().enumerate() {
+            let vector_id = base + 1 + i as u64;
+            wal.log_insert(vector_id, data)?;
+            ids.push(vector_id);
+        }
+        // Single fsync for the whole batch (group commit).
+        wal.flush()?;
+        ordinary_write_failpoint("wal_durable");
+
+        // Write all vectors to the mmap.
+        for (i, data) in batch.iter().enumerate() {
+            let vector_id = base + 1 + i as u64;
+            self.insert_raw(vector_id, data)?;
+        }
+
+        Ok(ids)
+    }
+
     /// Durably mark a vector ID as deleted.
     ///
     /// The delete record is fsynced to the WAL before the in-memory tombstone
@@ -268,6 +310,58 @@ impl VectorStore {
             std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.header.dimension as usize)
         };
         Ok(floats)
+    }
+
+    /// Read a vector by slot without bounds checking or `Result` wrapping.
+    ///
+    /// This is the hot-path accessor used by graph traversal, where every slot
+    /// is known to be valid because it came from the graph structure. It skips
+    /// the bounds check and error-path overhead of [`Self::get_vector`].
+    ///
+    /// # Panics (debug only)
+    /// Debug-asserts that `slot` is in range. In release builds an out-of-range
+    /// slot is undefined behavior — callers must only pass slots `< len()`.
+    #[inline]
+    pub fn get_vector_unchecked(&self, slot: usize) -> &[f32] {
+        debug_assert!(
+            slot < self.header.vector_count as usize,
+            "slot {slot} out of range (count {})",
+            self.header.vector_count
+        );
+        let offset = HEADER_SIZE + slot * self.record_size;
+        let vector_offset = offset + self.vector_data_offset();
+        let mmap = self.mmap.as_ref().expect("vector store mmap is open");
+        let bytes = &mmap[vector_offset..offset + self.record_size];
+        // SAFETY: same alignment/validity argument as `get_vector`; the caller
+        // guarantees `slot` is in range, so `offset + record_size` is in bounds.
+        unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.header.dimension as usize)
+        }
+    }
+
+    /// Prefetch the cache line(s) holding the vector at `slot`.
+    ///
+    /// A best-effort hint to start fetching the vector's first cache line before
+    /// its distance is computed. No-op on non-x86_64 targets.
+    #[inline]
+    pub fn prefetch_vector(&self, slot: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            debug_assert!(slot < self.header.vector_count as usize);
+            let offset = HEADER_SIZE + slot * self.record_size + self.vector_data_offset();
+            let mmap = self.mmap.as_ref().expect("vector store mmap is open");
+            let ptr = mmap[offset..].as_ptr();
+            // SAFETY: prefetch is a non-faulting hint; the pointer is within the
+            // mapping. SSE is part of the x86_64 baseline ISA, so `_mm_prefetch`
+            // is always available here.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = slot;
+        }
     }
 
     /// Return the number of vectors currently stored.
@@ -645,6 +739,49 @@ mod tests {
         assert_eq!(store.get_vector(0).unwrap(), &[1.0, 2.0]);
         assert_eq!(store.get_vector(1).unwrap(), &[3.0, 4.0]);
         assert_eq!(store.get_vector(2).unwrap(), &[5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_insert_batch_assigns_sequential_ids_and_reads_back() {
+        let (_dir, mut store) = setup(3);
+        let a = [1.0, 2.0, 3.0];
+        let b = [4.0, 5.0, 6.0];
+        let c = [7.0, 8.0, 9.0];
+        let ids = store.insert_batch(&[&a, &b, &c]).unwrap();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get_vector(0).unwrap(), &a);
+        assert_eq!(store.get_vector(1).unwrap(), &b);
+        assert_eq!(store.get_vector(2).unwrap(), &c);
+    }
+
+    #[test]
+    fn test_insert_batch_empty_is_noop() {
+        let (_dir, mut store) = setup(3);
+        let ids = store.insert_batch(&[]).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_batch_rejects_bad_dimension_without_partial_commit() {
+        let (_dir, mut store) = setup(3);
+        let good = [1.0, 2.0, 3.0];
+        let bad = [1.0, 2.0]; // wrong dimension
+        let result = store.insert_batch(&[&good, &bad]);
+        assert!(result.is_err());
+        // Nothing should have been committed.
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_batch_then_single_insert_continues_ids() {
+        let (_dir, mut store) = setup(2);
+        let ids = store.insert_batch(&[&[1.0, 1.0], &[2.0, 2.0]]).unwrap();
+        assert_eq!(ids, vec![1, 2]);
+        let next = store.insert(&[3.0, 3.0]).unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(store.len(), 3);
     }
 
     #[test]

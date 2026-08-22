@@ -89,15 +89,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "building Quiver HNSW: M={} ef_construction={} vectors={}",
         args.m, args.ef_construction, args.base_limit
     );
+    const BATCH: usize = 1024;
+    let mut buffer: Vec<Vec<f32>> = Vec::with_capacity(BATCH);
     let build_started = Instant::now();
     let inserted = stream_fvecs(&args.base, args.base_limit, |position, vector| {
-        index.insert(vector).map_err(io::Error::other)?;
+        buffer.push(vector.to_vec());
+        if buffer.len() >= BATCH {
+            flush_batch(&mut index, &mut buffer)?;
+        }
         if position.is_multiple_of(10_000) {
             println!("inserted {position} vectors");
             io::stdout().flush()?;
         }
         Ok(())
     })?;
+    flush_batch(&mut index, &mut buffer)?;
     index.flush()?;
     let build_seconds = build_started.elapsed().as_secs_f64();
     let rss_after_build_bytes = current_rss_bytes();
@@ -131,11 +137,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         peak_rss_bytes,
         data_file_bytes: fs::metadata(&data_path)?.len(),
         wal_file_bytes: fs::metadata(&wal_path)?.len(),
-        insert_durability: "CRC32 WAL record fsynced before every acknowledged insert",
+        insert_durability: "CRC32 WAL records group-committed (one fsync per batch) before acknowledgment",
         search,
     };
     fs::write(&args.output, serde_json::to_vec_pretty(&result)?)?;
     println!("wrote {}", args.output.display());
+    Ok(())
+}
+
+/// Group-commit any buffered vectors to the index in a single batched WAL fsync.
+fn flush_batch(index: &mut HnswIndex, buffer: &mut Vec<Vec<f32>>) -> io::Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&[f32]> = buffer.iter().map(|v| v.as_slice()).collect();
+    index.insert_batch(&refs).map_err(io::Error::other)?;
+    buffer.clear();
     Ok(())
 }
 
