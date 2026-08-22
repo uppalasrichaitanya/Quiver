@@ -1,6 +1,6 @@
 use std::{
     env,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
 };
 
 use axum::{
@@ -16,7 +16,7 @@ use quiver_core::{
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
-type SharedIndex = Arc<Mutex<HnswIndex>>;
+type SharedIndex = Arc<RwLock<HnswIndex>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -33,6 +33,16 @@ struct InsertResponse {
 }
 #[derive(Deserialize)]
 struct SearchRequest {
+    vector: Vec<f32>,
+    k: usize,
+    ef_search: Option<usize>,
+}
+#[derive(Deserialize)]
+struct BatchSearchRequest {
+    queries: Vec<BatchQuery>,
+}
+#[derive(Deserialize)]
+struct BatchQuery {
     vector: Vec<f32>,
     k: usize,
     ef_search: Option<usize>,
@@ -77,9 +87,10 @@ async fn main() {
         .route("/health", get(health))
         .route("/vectors", post(insert))
         .route("/search", post(search))
+        .route("/search/batch", post(search_batch))
         .route("/vectors/{id}", delete(remove))
         .with_state(AppState {
-            index: Arc::new(Mutex::new(index)),
+            index: Arc::new(RwLock::new(index)),
         });
     axum::serve(listener, app).await.expect("serve HTTP API");
 }
@@ -94,7 +105,7 @@ async fn insert(
 ) -> Result<(StatusCode, Json<InsertResponse>), (StatusCode, Json<ErrorResponse>)> {
     let id = state
         .index
-        .lock()
+        .write()
         .unwrap()
         .insert(&request.vector)
         .map_err(api_error)?;
@@ -107,7 +118,7 @@ async fn search(
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
     let hits = state
         .index
-        .lock()
+        .read()
         .unwrap()
         .search(&request.vector, request.k, request.ef_search.unwrap_or(100))
         .map_err(api_error)?;
@@ -121,11 +132,49 @@ async fn search(
     ))
 }
 
+async fn search_batch(
+    State(state): State<AppState>,
+    Json(request): Json<BatchSearchRequest>,
+) -> Result<Json<Vec<Vec<SearchHit>>>, (StatusCode, Json<ErrorResponse>)> {
+    if request.queries.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "queries must not be empty".into(),
+            }),
+        ));
+    }
+    if request.queries.iter().any(|query| query.k < 1) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "k must be at least 1 for every query".into(),
+            }),
+        ));
+    }
+    let index = state.index.read().unwrap();
+    let mut results = Vec::with_capacity(request.queries.len());
+    for query in &request.queries {
+        let hits = index
+            .search(&query.vector, query.k, query.ef_search.unwrap_or(100))
+            .map_err(api_error)?;
+        results.push(
+            hits.into_iter()
+                .map(|hit| SearchHit {
+                    id: hit.vector_id,
+                    distance: hit.distance,
+                })
+                .collect(),
+        );
+    }
+    Ok(Json(results))
+}
+
 async fn remove(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    state.index.lock().unwrap().delete(id).map_err(api_error)?;
+    state.index.write().unwrap().delete(id).map_err(api_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
