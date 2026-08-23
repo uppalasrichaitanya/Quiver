@@ -19,8 +19,11 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
 
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -28,6 +31,15 @@ use crate::distance::{Metric, compute_distance};
 use crate::error::{QuiverError, Result};
 use crate::index::SearchResult;
 use crate::storage::vecstore::VectorStore;
+
+/// Magic bytes identifying a persisted HNSW graph-topology snapshot.
+const GRAPH_MAGIC: &[u8; 4] = b"QVGR";
+
+/// Current graph-snapshot format version.
+const GRAPH_FORMAT_VERSION: u8 = 1;
+
+/// Size of the graph-snapshot header in bytes (through and including the header CRC).
+const GRAPH_HEADER_SIZE: usize = 84;
 
 /// HNSW tuning parameters.
 #[derive(Debug, Clone)]
@@ -187,6 +199,8 @@ thread_local! {
 pub struct HnswIndex {
     /// The underlying vector storage.
     store: VectorStore,
+    /// Path to the vector data file, used to derive the graph-snapshot path.
+    data_path: PathBuf,
     /// The HNSW graph nodes.
     nodes: Vec<HnswNode>,
     /// Fixed-capacity adjacency blocks containing 32-bit node IDs.
@@ -204,6 +218,9 @@ pub struct HnswIndex {
     tombstone_count: usize,
     /// Deterministic random generator for layer assignment.
     rng: StdRng,
+    /// True when the graph topology was loaded from a persisted snapshot on
+    /// `open` instead of being rebuilt from the stored vectors.
+    loaded_from_snapshot: bool,
 }
 
 impl HnswIndex {
@@ -215,10 +232,12 @@ impl HnswIndex {
         metric: Metric,
         config: HnswConfig,
     ) -> Result<Self> {
-        let store = VectorStore::create(data_path, wal_path, dimension, metric)?;
+        let data_path = data_path.as_ref().to_path_buf();
+        let store = VectorStore::create(&data_path, wal_path, dimension, metric)?;
         let rng = StdRng::seed_from_u64(config.random_seed);
         Ok(Self {
             store,
+            data_path,
             nodes: Vec::new(),
             adjacency_links: Vec::new(),
             level_blocks: Vec::new(),
@@ -227,22 +246,29 @@ impl HnswIndex {
             config,
             tombstone_count: 0,
             rng,
+            loaded_from_snapshot: false,
         })
     }
 
-    /// Open an existing HNSW index and rebuild the graph from stored vectors.
+    /// Open an existing HNSW index.
     ///
-    /// Since the HNSW graph structure is not persisted (v1 simplification),
-    /// this re-inserts all vectors into a fresh graph after WAL replay.
+    /// If a valid graph-topology snapshot (written by [`HnswIndex::flush`] or
+    /// [`HnswIndex::compact`]) is present and matches the recovered store, the
+    /// graph is loaded from it directly and the expensive rebuild is skipped.
+    /// Otherwise the graph is rebuilt by re-inserting all stored vectors after
+    /// WAL replay. Deletion state is always re-derived from the store, which is
+    /// authoritative for tombstones.
     pub fn open(
         data_path: impl AsRef<Path>,
         wal_path: impl AsRef<Path>,
         config: HnswConfig,
     ) -> Result<Self> {
-        let store = VectorStore::open(data_path, wal_path)?;
+        let data_path = data_path.as_ref().to_path_buf();
+        let store = VectorStore::open(&data_path, wal_path)?;
         let rng = StdRng::seed_from_u64(config.random_seed);
         let mut index = Self {
             store,
+            data_path,
             nodes: Vec::new(),
             adjacency_links: Vec::new(),
             level_blocks: Vec::new(),
@@ -251,24 +277,22 @@ impl HnswIndex {
             config,
             tombstone_count: 0,
             rng,
+            loaded_from_snapshot: false,
         };
 
-        // Rebuild graph from stored vectors
         let n = index.store.len();
         if n > 0 {
-            tracing::info!(count = n, "Rebuilding HNSW graph from stored vectors");
-            for slot in 0..n {
-                let vector = index.store.get_vector(slot)?.to_vec();
-                let vector_id = index.store.vector_id(slot)?;
-                index.insert_into_graph(slot, vector_id, &vector);
-            }
-
-            for node in &mut index.nodes {
-                if index.store.is_deleted(node.vector_id) {
-                    node.deleted = true;
-                    index.tombstone_count += 1;
+            if index.try_load_graph() {
+                tracing::info!(count = n, "Loaded HNSW graph topology from snapshot");
+            } else {
+                tracing::info!(count = n, "Rebuilding HNSW graph from stored vectors");
+                for slot in 0..n {
+                    let vector = index.store.get_vector(slot)?.to_vec();
+                    let vector_id = index.store.vector_id(slot)?;
+                    index.insert_into_graph(slot, vector_id, &vector);
                 }
             }
+            index.apply_deletion_state();
         }
 
         Ok(index)
@@ -352,8 +376,9 @@ impl HnswIndex {
                     if self.nodes[neighbor_idx].deleted {
                         continue;
                     }
-                    let neighbor_vec =
-                        self.store.get_vector_unchecked(self.nodes[neighbor_idx].slot);
+                    let neighbor_vec = self
+                        .store
+                        .get_vector_unchecked(self.nodes[neighbor_idx].slot);
                     let dist = compute_distance(query, neighbor_vec, metric);
                     if dist < current_dist {
                         current = neighbor_idx;
@@ -432,9 +457,17 @@ impl HnswIndex {
         self.store.metric()
     }
 
-    /// Flush the underlying storage to disk.
+    /// Flush the underlying storage to disk and persist the graph topology.
+    ///
+    /// The graph snapshot is an optimization for fast reopen: if writing it
+    /// fails the data is still durable (the store was flushed), so the error is
+    /// logged rather than returned and the next reopen simply rebuilds.
     pub fn flush(&mut self) -> Result<()> {
-        self.store.flush()
+        self.store.flush()?;
+        if let Err(e) = self.write_graph_snapshot() {
+            tracing::warn!(error = %e, "failed to persist HNSW graph snapshot");
+        }
+        Ok(())
     }
 
     /// Rewrite storage with live vectors only and rebuild the HNSW graph.
@@ -446,11 +479,17 @@ impl HnswIndex {
         self.entry_point = None;
         self.max_level = 0;
         self.tombstone_count = 0;
+        self.rng = StdRng::seed_from_u64(self.config.random_seed);
+        self.loaded_from_snapshot = false;
 
         for slot in 0..self.store.len() {
             let vector = self.store.get_vector(slot)?.to_vec();
             let vector_id = self.store.vector_id(slot)?;
             self.insert_into_graph(slot, vector_id, &vector);
+        }
+
+        if let Err(e) = self.write_graph_snapshot() {
+            tracing::warn!(error = %e, "failed to persist HNSW graph snapshot after compaction");
         }
 
         Ok(())
@@ -469,6 +508,289 @@ impl HnswIndex {
     /// Return the current max level of the graph.
     pub fn max_level(&self) -> usize {
         self.max_level
+    }
+
+    // ── Graph-topology snapshot persistence ──────────────────────────────
+    //
+    // The graph topology (nodes, packed adjacency arena, per-node level blocks,
+    // entry point, and max level) is serialized to a snapshot file next to the
+    // vector data file (`<data_path>.graph`) on `flush`/`compact`. On `open`,
+    // a snapshot that passes strict validation is loaded directly, skipping the
+    // O(n) rebuild. Any mismatch or corruption falls back to rebuilding. The
+    // snapshot is an optimization only: deletion state is always re-derived from
+    // the store, and a missing/corrupt snapshot never compromises correctness.
+
+    /// Path of the graph-topology snapshot derived from the vector data path.
+    fn graph_snapshot_path(&self) -> PathBuf {
+        let mut s = std::ffi::OsString::from(self.data_path.as_os_str());
+        s.push(".graph");
+        PathBuf::from(s)
+    }
+
+    /// Serialize the graph topology to a byte buffer with CRC32 integrity checks.
+    fn serialize_graph(&self) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_all(GRAPH_MAGIC).unwrap();
+        buf.write_u8(GRAPH_FORMAT_VERSION).unwrap();
+        buf.write_u8(self.store.metric() as u8).unwrap();
+        buf.write_all(&[0u8; 2]).unwrap();
+        buf.write_u32::<LittleEndian>(self.store.dimension())
+            .unwrap();
+        buf.write_u32::<LittleEndian>(self.config.m as u32).unwrap();
+        buf.write_u32::<LittleEndian>(self.config.m_max0 as u32)
+            .unwrap();
+        buf.write_u32::<LittleEndian>(self.config.ef_construction as u32)
+            .unwrap();
+        buf.write_u64::<LittleEndian>(self.config.random_seed)
+            .unwrap();
+        buf.write_u64::<LittleEndian>(self.nodes.len() as u64)
+            .unwrap();
+        buf.write_u64::<LittleEndian>(self.adjacency_links.len() as u64)
+            .unwrap();
+        buf.write_u64::<LittleEndian>(self.level_blocks.len() as u64)
+            .unwrap();
+        let ep = self.entry_point.map(|e| e as i64).unwrap_or(-1);
+        buf.write_i64::<LittleEndian>(ep).unwrap();
+        buf.write_u64::<LittleEndian>(self.max_level as u64)
+            .unwrap();
+        buf.write_u64::<LittleEndian>(self.store.len() as u64)
+            .unwrap();
+        let header_crc = crc32fast::hash(&buf);
+        buf.write_u32::<LittleEndian>(header_crc).unwrap();
+
+        let body_start = buf.len();
+        for node in &self.nodes {
+            buf.write_u64::<LittleEndian>(node.slot as u64).unwrap();
+            buf.write_u64::<LittleEndian>(node.vector_id).unwrap();
+            buf.write_u32::<LittleEndian>(node.max_layer as u32)
+                .unwrap();
+            buf.write_u32::<LittleEndian>(node.levels_offset).unwrap();
+        }
+        for &link in &self.adjacency_links {
+            buf.write_u32::<LittleEndian>(link).unwrap();
+        }
+        for lb in &self.level_blocks {
+            buf.write_u32::<LittleEndian>(lb.offset).unwrap();
+            buf.write_u32::<LittleEndian>(lb.len).unwrap();
+            buf.write_u32::<LittleEndian>(lb.capacity).unwrap();
+        }
+        let body_crc = crc32fast::hash(&buf[body_start..]);
+        buf.write_u32::<LittleEndian>(body_crc).unwrap();
+        buf
+    }
+
+    /// Write the graph snapshot atomically (temp file + fsync + rename).
+    fn write_graph_snapshot(&self) -> Result<()> {
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+        let bytes = self.serialize_graph();
+        let final_path = self.graph_snapshot_path();
+        let mut tmp = std::ffi::OsString::from(final_path.as_os_str());
+        tmp.push(".tmp");
+        let tmp_path = PathBuf::from(tmp);
+        {
+            let mut f = File::create(&tmp_path)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        // A missing or torn snapshot only triggers a safe rebuild, so removing
+        // the old file before the rename is crash-safe.
+        let _ = fs::remove_file(&final_path);
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Try to load the graph topology from the snapshot file. Returns true on
+    /// success; on a missing, corrupt, or mismatched snapshot returns false and
+    /// leaves the graph empty so the caller rebuilds.
+    fn try_load_graph(&mut self) -> bool {
+        let path = self.graph_snapshot_path();
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        match self.load_graph_from_bytes(&data) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "graph snapshot invalid; falling back to rebuild");
+                false
+            }
+        }
+    }
+
+    /// Parse and validate a snapshot, applying it to this index on success.
+    fn load_graph_from_bytes(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < GRAPH_HEADER_SIZE {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot too short".to_string(),
+            ));
+        }
+        let mut cur = Cursor::new(data);
+        let mut magic = [0u8; 4];
+        cur.read_exact(&mut magic)?;
+        if &magic != GRAPH_MAGIC {
+            return Err(QuiverError::InvalidFormat(
+                "invalid graph snapshot magic".to_string(),
+            ));
+        }
+        let version = cur.read_u8()?;
+        if version != GRAPH_FORMAT_VERSION {
+            return Err(QuiverError::InvalidFormat(format!(
+                "unsupported graph snapshot version: {version}"
+            )));
+        }
+        let metric_byte = cur.read_u8()?;
+        let mut reserved = [0u8; 2];
+        cur.read_exact(&mut reserved)?;
+        let dimension = cur.read_u32::<LittleEndian>()?;
+        let m = cur.read_u32::<LittleEndian>()? as usize;
+        let m_max0 = cur.read_u32::<LittleEndian>()? as usize;
+        let _ef_construction = cur.read_u32::<LittleEndian>()?;
+        let random_seed = cur.read_u64::<LittleEndian>()?;
+        let node_count = cur.read_u64::<LittleEndian>()? as usize;
+        let adjacency_len = cur.read_u64::<LittleEndian>()? as usize;
+        let level_block_count = cur.read_u64::<LittleEndian>()? as usize;
+        let entry_point_raw = cur.read_i64::<LittleEndian>()?;
+        let max_level = cur.read_u64::<LittleEndian>()? as usize;
+        let store_len = cur.read_u64::<LittleEndian>()? as usize;
+        let header_crc = cur.read_u32::<LittleEndian>()?;
+
+        if crc32fast::hash(&data[..GRAPH_HEADER_SIZE - 4]) != header_crc {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot header checksum mismatch".to_string(),
+            ));
+        }
+
+        let metric =
+            Metric::from_u8(metric_byte).ok_or(QuiverError::UnsupportedMetric(metric_byte))?;
+        if dimension != self.store.dimension()
+            || metric != self.store.metric()
+            || m != self.config.m
+            || m_max0 != self.config.m_max0
+            || random_seed != self.config.random_seed
+            || node_count != self.store.len()
+            || store_len != self.store.len()
+        {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot does not match store or config".to_string(),
+            ));
+        }
+
+        let body_bytes = node_count * 24 + adjacency_len * 4 + level_block_count * 12;
+        let crc_start = GRAPH_HEADER_SIZE + body_bytes;
+        if data.len() < crc_start + 4 {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot body truncated".to_string(),
+            ));
+        }
+        let body = &data[GRAPH_HEADER_SIZE..crc_start];
+        let body_crc = (&data[crc_start..crc_start + 4]).read_u32::<LittleEndian>()?;
+        if crc32fast::hash(body) != body_crc {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot body checksum mismatch".to_string(),
+            ));
+        }
+
+        let mut bcur = Cursor::new(body);
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            let slot = bcur.read_u64::<LittleEndian>()? as usize;
+            let vector_id = bcur.read_u64::<LittleEndian>()?;
+            let max_layer = bcur.read_u32::<LittleEndian>()? as usize;
+            let levels_offset = bcur.read_u32::<LittleEndian>()?;
+            if slot >= self.store.len() || self.store.vector_id(slot)? != vector_id {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot node does not match stored vector".to_string(),
+                ));
+            }
+            if levels_offset as usize + max_layer + 1 > level_block_count {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot level block out of range".to_string(),
+                ));
+            }
+            nodes.push(HnswNode {
+                slot,
+                vector_id,
+                max_layer,
+                levels_offset,
+                deleted: false,
+            });
+        }
+        let mut adjacency_links = Vec::with_capacity(adjacency_len);
+        for _ in 0..adjacency_len {
+            adjacency_links.push(bcur.read_u32::<LittleEndian>()?);
+        }
+        let mut level_blocks = Vec::with_capacity(level_block_count);
+        for _ in 0..level_block_count {
+            let offset = bcur.read_u32::<LittleEndian>()?;
+            let len = bcur.read_u32::<LittleEndian>()?;
+            let capacity = bcur.read_u32::<LittleEndian>()?;
+            if offset as usize + len as usize > adjacency_len {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot adjacency block out of range".to_string(),
+                ));
+            }
+            if capacity != self.config.m as u32 && capacity != self.config.m_max0 as u32 {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot block capacity does not match config".to_string(),
+                ));
+            }
+            level_blocks.push(LevelBlock {
+                offset,
+                len,
+                capacity,
+            });
+        }
+
+        let entry_point = if entry_point_raw < 0 {
+            None
+        } else {
+            let ep = entry_point_raw as usize;
+            if ep >= node_count {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot entry point out of range".to_string(),
+                ));
+            }
+            Some(ep)
+        };
+        match entry_point {
+            Some(ep) if nodes[ep].max_layer == max_level => {}
+            _ => {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot entry point / max level inconsistent".to_string(),
+                ));
+            }
+        }
+
+        self.nodes = nodes;
+        self.adjacency_links = adjacency_links;
+        self.level_blocks = level_blocks;
+        self.entry_point = entry_point;
+        self.max_level = max_level;
+        self.loaded_from_snapshot = true;
+        self.advance_rng(node_count);
+        Ok(())
+    }
+
+    /// Re-derive per-node deletion flags and the tombstone count from the store,
+    /// which is authoritative for durable deletions.
+    fn apply_deletion_state(&mut self) {
+        self.tombstone_count = 0;
+        for node in &mut self.nodes {
+            node.deleted = self.store.is_deleted(node.vector_id);
+            if node.deleted {
+                self.tombstone_count += 1;
+            }
+        }
+    }
+
+    /// Advance the layer-assignment RNG by `n` draws, matching the one draw per
+    /// inserted node, so future inserts stay deterministic after a snapshot load.
+    fn advance_rng(&mut self, n: usize) {
+        for _ in 0..n {
+            let _: f64 = self.rng.random();
+        }
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
@@ -528,14 +850,13 @@ impl HnswIndex {
         // Create the new node
         let m_max0 = self.config.m_max0;
         let m = self.config.m;
-        let levels_offset = u32::try_from(self.level_blocks.len())
-            .expect("level block arena exceeds u32 capacity");
+        let levels_offset =
+            u32::try_from(self.level_blocks.len()).expect("level block arena exceeds u32 capacity");
         for level in 0..=new_level {
             let capacity = if level == 0 { m_max0 } else { m };
             let offset = u32::try_from(self.adjacency_links.len())
                 .expect("adjacency arena exceeds u32 capacity");
-            self.adjacency_links
-                .resize(offset as usize + capacity, 0);
+            self.adjacency_links.resize(offset as usize + capacity, 0);
             self.level_blocks.push(LevelBlock {
                 offset,
                 len: 0,
@@ -577,7 +898,9 @@ impl HnswIndex {
                 let neighbors = self.neighbors(current, level);
                 for &neighbor_link in neighbors {
                     let neighbor_idx = neighbor_link as usize;
-                    let n_vec = self.store.get_vector_unchecked(self.nodes[neighbor_idx].slot);
+                    let n_vec = self
+                        .store
+                        .get_vector_unchecked(self.nodes[neighbor_idx].slot);
                     let dist = compute_distance(vector, n_vec, metric);
                     if dist < current_dist {
                         current = neighbor_idx;
@@ -609,8 +932,7 @@ impl HnswIndex {
                 if level <= self.nodes[neighbor_idx].max_layer {
                     let max_conn = if level == 0 { m_max0 } else { m };
                     let existing = self.neighbors(neighbor_idx, level);
-                    let mut reverse_neighbors: Vec<usize> =
-                        Vec::with_capacity(existing.len() + 1);
+                    let mut reverse_neighbors: Vec<usize> = Vec::with_capacity(existing.len() + 1);
                     reverse_neighbors.extend(existing.iter().map(|&link| link as usize));
                     reverse_neighbors.push(new_node_idx);
                     if reverse_neighbors.len() > max_conn {
@@ -665,7 +987,9 @@ impl HnswIndex {
         metric: Metric,
         pool: &mut VisitedPool,
     ) -> Vec<Candidate> {
-        let ep_vec = self.store.get_vector_unchecked(self.nodes[entry_point].slot);
+        let ep_vec = self
+            .store
+            .get_vector_unchecked(self.nodes[entry_point].slot);
         let ep_dist = compute_distance(query, ep_vec, metric);
 
         pool.visit(entry_point);
@@ -709,7 +1033,9 @@ impl HnswIndex {
                     continue;
                 }
 
-                let n_vec = self.store.get_vector_unchecked(self.nodes[neighbor_idx].slot);
+                let n_vec = self
+                    .store
+                    .get_vector_unchecked(self.nodes[neighbor_idx].slot);
                 let dist = compute_distance(query, n_vec, metric);
                 let worst_dist = results.peek().map(|c| c.distance).unwrap_or(f32::MAX);
 
@@ -1198,5 +1524,214 @@ mod tests {
 
         let results = index.search(&[1.0, 0.0, 0.0], 2, 50).unwrap();
         assert!(results.iter().all(|result| result.vector_id != deleted_id));
+    }
+
+    /// Mirror of `HnswIndex::graph_snapshot_path` for use in tests after the
+    /// index has been dropped.
+    fn snapshot_path_for(data_path: &Path) -> PathBuf {
+        let mut s = std::ffi::OsString::from(data_path.as_os_str());
+        s.push(".graph");
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn test_reopen_loads_graph_snapshot_without_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_snap_load.qvdb");
+        let wal_path = dir.path().join("hnsw_snap_load.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+
+        let vectors: Vec<Vec<f32>> = (0..50)
+            .map(|i| vec![i as f32, (i % 7) as f32, (i % 3) as f32])
+            .collect();
+
+        let before;
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, config.clone()).unwrap();
+            for v in &vectors {
+                index.insert(v).unwrap();
+            }
+            index.flush().unwrap();
+            assert!(!index.loaded_from_snapshot);
+            before = index.search(&[10.0, 3.0, 1.0], 5, 50).unwrap();
+        }
+
+        assert!(
+            snapshot_path_for(&data_path).exists(),
+            "flush must write a graph snapshot"
+        );
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert!(
+            index.loaded_from_snapshot,
+            "open should load the persisted snapshot instead of rebuilding"
+        );
+        assert_eq!(index.len(), 50);
+        assert_eq!(index.total_nodes(), 50);
+        let after = index.search(&[10.0, 3.0, 1.0], 5, 50).unwrap();
+        let before_ids: Vec<u64> = before.iter().map(|r| r.vector_id).collect();
+        let after_ids: Vec<u64> = after.iter().map(|r| r.vector_id).collect();
+        assert_eq!(before_ids, after_ids);
+    }
+
+    #[test]
+    fn test_corrupt_graph_snapshot_falls_back_to_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_snap_corrupt.qvdb");
+        let wal_path = dir.path().join("hnsw_snap_corrupt.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, config.clone()).unwrap();
+            for i in 0..30 {
+                index.insert(&[i as f32, 0.0, 0.0]).unwrap();
+            }
+            index.flush().unwrap();
+        }
+
+        // Flip bits in the trailing body-checksum region to corrupt the snapshot.
+        let snap = snapshot_path_for(&data_path);
+        let mut bytes = std::fs::read(&snap).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&snap, &bytes).unwrap();
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert!(
+            !index.loaded_from_snapshot,
+            "corrupt snapshot must trigger a rebuild"
+        );
+        assert_eq!(index.len(), 30);
+        let results = index.search(&[5.0, 0.0, 0.0], 1, 50).unwrap();
+        assert_eq!(results[0].slot, 5);
+    }
+
+    #[test]
+    fn test_missing_graph_snapshot_rebuilds() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_snap_missing.qvdb");
+        let wal_path = dir.path().join("hnsw_snap_missing.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, config.clone()).unwrap();
+            for i in 0..20 {
+                index.insert(&[i as f32, 0.0, 0.0]).unwrap();
+            }
+            index.flush().unwrap();
+        }
+
+        std::fs::remove_file(snapshot_path_for(&data_path)).unwrap();
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert!(!index.loaded_from_snapshot);
+        assert_eq!(index.len(), 20);
+        let results = index.search(&[7.0, 0.0, 0.0], 1, 50).unwrap();
+        assert_eq!(results[0].slot, 7);
+    }
+
+    #[test]
+    fn test_config_mismatch_ignores_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_snap_cfg.qvdb");
+        let wal_path = dir.path().join("hnsw_snap_cfg.wal");
+        let build_config = HnswConfig::new(8).with_ef_construction(50);
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, build_config).unwrap();
+            for i in 0..25 {
+                index.insert(&[i as f32, 0.0, 0.0]).unwrap();
+            }
+            index.flush().unwrap();
+        }
+
+        // Reopen with a different M: the snapshot must be rejected and rebuilt.
+        let open_config = HnswConfig::new(16).with_ef_construction(50);
+        let index = HnswIndex::open(&data_path, &wal_path, open_config).unwrap();
+        assert!(
+            !index.loaded_from_snapshot,
+            "config mismatch must not load the snapshot"
+        );
+        assert_eq!(index.len(), 25);
+        let results = index.search(&[3.0, 0.0, 0.0], 1, 50).unwrap();
+        assert_eq!(results[0].slot, 3);
+    }
+
+    #[test]
+    fn test_delete_state_rederived_on_snapshot_load() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_snap_delete.qvdb");
+        let wal_path = dir.path().join("hnsw_snap_delete.wal");
+        let mut config = HnswConfig::new(8).with_ef_construction(50);
+        config.max_tombstone_ratio = 1.0;
+
+        let deleted_id;
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 3, Metric::L2, config.clone()).unwrap();
+            deleted_id = index.insert(&[1.0, 0.0, 0.0]).unwrap();
+            index.insert(&[0.0, 1.0, 0.0]).unwrap();
+            index.insert(&[0.0, 0.0, 1.0]).unwrap();
+            index.delete(deleted_id).unwrap();
+            index.flush().unwrap();
+        }
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert!(index.loaded_from_snapshot);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.tombstone_count, 1);
+        let results = index.search(&[1.0, 0.0, 0.0], 3, 50).unwrap();
+        assert!(results.iter().all(|r| r.vector_id != deleted_id));
+    }
+
+    #[test]
+    fn test_insert_after_snapshot_load_matches_fresh_build() {
+        // Verifies the RNG fast-forward: inserting after a snapshot load must
+        // reproduce exactly the same graph as a fresh build with the same inserts.
+        let dir = TempDir::new().unwrap();
+        let vectors: Vec<Vec<f32>> = (0..40)
+            .map(|i| vec![i as f32, (i % 5) as f32, 0.0])
+            .collect();
+        let new_vec = vec![12.5, 2.0, 0.0];
+        let config = HnswConfig::new(8).with_ef_construction(50);
+
+        // Path A: build, flush, reopen from snapshot, then insert.
+        let (da, wa) = (dir.path().join("a.qvdb"), dir.path().join("a.wal"));
+        {
+            let mut idx = HnswIndex::create(&da, &wa, 3, Metric::L2, config.clone()).unwrap();
+            for v in &vectors {
+                idx.insert(v).unwrap();
+            }
+            idx.flush().unwrap();
+        }
+        let mut reopened = HnswIndex::open(&da, &wa, config.clone()).unwrap();
+        assert!(reopened.loaded_from_snapshot);
+        reopened.insert(&new_vec).unwrap();
+
+        // Path B: fresh build with the same inserts.
+        let (db, wb) = (dir.path().join("b.qvdb"), dir.path().join("b.wal"));
+        let mut fresh = HnswIndex::create(&db, &wb, 3, Metric::L2, config.clone()).unwrap();
+        for v in &vectors {
+            fresh.insert(v).unwrap();
+        }
+        fresh.insert(&new_vec).unwrap();
+
+        assert_eq!(reopened.nodes.len(), fresh.nodes.len());
+        for (a, b) in reopened.nodes.iter().zip(fresh.nodes.iter()) {
+            assert_eq!(a.slot, b.slot);
+            assert_eq!(a.vector_id, b.vector_id);
+            assert_eq!(a.max_layer, b.max_layer);
+            assert_eq!(a.levels_offset, b.levels_offset);
+        }
+        assert_eq!(reopened.entry_point, fresh.entry_point);
+        assert_eq!(reopened.max_level, fresh.max_level);
+        assert_eq!(reopened.adjacency_links, fresh.adjacency_links);
+        assert_eq!(reopened.level_blocks.len(), fresh.level_blocks.len());
+        for (a, b) in reopened.level_blocks.iter().zip(fresh.level_blocks.iter()) {
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.len, b.len);
+            assert_eq!(a.capacity, b.capacity);
+        }
     }
 }

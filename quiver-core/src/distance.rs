@@ -347,9 +347,8 @@ mod avx2 {
 fn simd_enabled() -> bool {
     use std::sync::LazyLock;
 
-    static SIMD_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
-    });
+    static SIMD_ENABLED: LazyLock<bool> =
+        LazyLock::new(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"));
 
     *SIMD_ENABLED
 }
