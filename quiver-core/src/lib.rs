@@ -12,13 +12,12 @@
 //! - [`storage`] — Custom memory-mapped file format with versioned header and WAL
 //! - [`distance`] — Distance metrics (L2, cosine, dot product) with scalar and SIMD implementations
 //! - [`index`] — Index implementations (brute-force and HNSW)
+//! - [`metadata`] — Key-value vector metadata and filter predicates
 //! - [`error`] — Unified error types
 
 pub mod distance;
 pub mod error;
 pub mod index;
+pub mod metadata;
 pub mod quantization;
 pub mod storage;
-
-// Future modules (uncomment only when implemented):
-// pub mod filter;
