@@ -30,6 +30,7 @@ use rand::{Rng, SeedableRng};
 use crate::distance::{Metric, compute_distance};
 use crate::error::{QuiverError, Result};
 use crate::index::SearchResult;
+use crate::metadata::{Filter, Metadata};
 use crate::storage::vecstore::VectorStore;
 
 /// Magic bytes identifying a persisted HNSW graph-topology snapshot.
@@ -319,6 +320,27 @@ impl HnswIndex {
         Ok(vector_id)
     }
 
+    /// Insert a vector with metadata into the index.
+    ///
+    /// Returns the assigned vector ID. The metadata is durable (see
+    /// [`VectorStore::insert_with_metadata`]) and can later be matched by
+    /// [`Self::search_filtered`].
+    pub fn insert_with_metadata(&mut self, vector: &[f32], metadata: Metadata) -> Result<u64> {
+        if vector.len() != self.store.dimension() as usize {
+            return Err(QuiverError::DimensionMismatch {
+                expected: self.store.dimension(),
+                actual: vector.len() as u32,
+            });
+        }
+
+        let vector_id = self.store.insert_with_metadata(vector, metadata)?;
+        let slot = self.store.len() - 1;
+
+        self.insert_into_graph(slot, vector_id, vector);
+
+        Ok(vector_id)
+    }
+
     /// Insert a batch of vectors.
     ///
     /// Storage is made durable with a single group-committed WAL fsync for the
@@ -337,11 +359,85 @@ impl HnswIndex {
         Ok(ids)
     }
 
+    /// Insert a batch of vectors with per-vector metadata.
+    ///
+    /// `metadata` must have exactly one entry per vector; `None` entries are
+    /// inserted without metadata. See [`Self::insert_batch`] for the storage
+    /// and ordering semantics.
+    pub fn insert_batch_with_metadata(
+        &mut self,
+        batch: &[&[f32]],
+        metadata: &[Option<Metadata>],
+    ) -> Result<Vec<u64>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.store.insert_batch_with_metadata(batch, metadata)?;
+        let base_slot = self.store.len() - ids.len();
+        for (i, vector) in batch.iter().enumerate() {
+            self.insert_into_graph(base_slot + i, ids[i], vector);
+        }
+        Ok(ids)
+    }
+
     /// Search for the `k` nearest neighbors of the query vector.
     ///
     /// `ef_search` controls the size of the dynamic candidate list. Higher values
     /// give better recall at the cost of speed. Must be >= k.
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Result<Vec<SearchResult>> {
+        let mut results = self.search_candidates(query, ef_search.max(k))?;
+        results.truncate(k);
+        Ok(results)
+    }
+
+    /// Search for the `k` nearest neighbors whose metadata matches `filter`.
+    ///
+    /// Naive post-filtering: candidates are over-fetched from the graph, then
+    /// filtered. Because the required over-fetch grows as selectivity shrinks,
+    /// the beam width starts at `max(ef_search, k)` and expands adaptively
+    /// until `k` matches are collected or the graph is exhausted. Vectors
+    /// without metadata never match. Fewer than `k` results are returned when
+    /// fewer than `k` vectors match.
+    ///
+    /// Cost therefore scales roughly with the inverse of filter selectivity —
+    /// the known limitation of post-filtering, and the motivation for a future
+    /// filter-aware traversal.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        filter: &Filter,
+    ) -> Result<Vec<SearchResult>> {
+        if k == 0 {
+            // Still validate the query and index state before returning empty.
+            self.search_candidates(query, 1)?;
+            return Ok(Vec::new());
+        }
+
+        let total = self.total_nodes();
+        let mut ef = ef_search.max(k).min(total).max(1);
+        loop {
+            let candidates = self.search_candidates(query, ef)?;
+            let mut matches: Vec<SearchResult> = candidates
+                .into_iter()
+                .filter(|result| {
+                    self.store
+                        .metadata(result.slot)
+                        .is_some_and(|metadata| filter.matches(metadata))
+                })
+                .collect();
+            if matches.len() >= k || ef >= total {
+                matches.truncate(k);
+                return Ok(matches);
+            }
+            ef = ef.saturating_mul(4).min(total);
+        }
+    }
+
+    /// Shared core of [`Self::search`] and [`Self::search_filtered`]: return up
+    /// to `ef` non-deleted results sorted by distance (closest first).
+    fn search_candidates(&self, query: &[f32], ef: usize) -> Result<Vec<SearchResult>> {
         if query.len() != self.store.dimension() as usize {
             return Err(QuiverError::DimensionMismatch {
                 expected: self.store.dimension(),
@@ -353,8 +449,6 @@ impl HnswIndex {
             Some(ep) => ep,
             None => return Err(QuiverError::EmptyIndex),
         };
-
-        let ef = ef_search.max(k);
 
         // Phase 1: Greedy descent from the entry point through upper layers
         let mut current = entry_point;
@@ -392,20 +486,17 @@ impl HnswIndex {
         // Phase 2: Beam search at layer 0 with ef candidates
         let candidates = self.search_layer(query, current, ef, 0, metric);
 
-        // Take top-k results
-        let mut results: Vec<SearchResult> = candidates
+        // `search_layer` returns candidates sorted closest-first; filtering
+        // preserves that order.
+        Ok(candidates
             .into_iter()
             .filter(|c| !self.nodes[c.node_idx].deleted)
-            .take(k)
             .map(|c| SearchResult {
                 slot: self.nodes[c.node_idx].slot,
                 vector_id: self.nodes[c.node_idx].vector_id,
                 distance: c.distance,
             })
-            .collect();
-
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        Ok(results)
+            .collect())
     }
 
     /// Mark a vector as deleted (tombstone).
@@ -1732,6 +1823,373 @@ mod tests {
             assert_eq!(a.offset, b.offset);
             assert_eq!(a.len, b.len);
             assert_eq!(a.capacity, b.capacity);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Metadata + filtered search
+    // ------------------------------------------------------------------
+
+    fn eq(key: &str, value: impl Into<crate::metadata::MetaValue>) -> Filter {
+        Filter::Eq {
+            key: key.to_owned(),
+            value: value.into(),
+        }
+    }
+
+    fn int_metadata(key: &str, value: i64) -> Metadata {
+        let mut metadata = Metadata::new();
+        metadata.insert(key, value);
+        metadata
+    }
+
+    #[test]
+    fn test_search_filtered_returns_only_matching_vectors() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        // Vector i sits at [i, 0] with metadata cat = i % 3.
+        for i in 0..12 {
+            index
+                .insert_with_metadata(&[i as f32, 0.0], int_metadata("cat", i % 3))
+                .unwrap();
+        }
+
+        let results = index
+            .search_filtered(&[0.0, 0.0], 10, 50, &eq("cat", 1i64))
+            .unwrap();
+        // i % 3 == 1 for i in {1, 4, 7, 10} -> ids {2, 5, 8, 11}, closest first.
+        let ids: Vec<u64> = results.iter().map(|r| r.vector_id).collect();
+        assert_eq!(ids, vec![2, 5, 8, 11]);
+        // Distances must be non-decreasing.
+        assert!(results.windows(2).all(|w| w[0].distance <= w[1].distance));
+        // Every result must carry the matching metadata.
+        for result in &results {
+            assert_eq!(
+                index.store.metadata(result.slot),
+                Some(&int_metadata("cat", 1))
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_filtered_ignores_vectors_without_metadata() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        index.insert(&[0.0, 0.0]).unwrap(); // closest, but no metadata
+        let matching_id = index
+            .insert_with_metadata(&[0.1, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        index.insert(&[0.2, 0.0]).unwrap(); // also no metadata
+
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, matching_id);
+    }
+
+    #[test]
+    fn test_search_filtered_returns_fewer_than_k_when_few_matches() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        for i in 0..10 {
+            let metadata = (i % 3 == 0).then(|| int_metadata("cat", 1));
+            match metadata {
+                Some(md) => index.insert_with_metadata(&[i as f32, 0.0], md).unwrap(),
+                None => index.insert(&[i as f32, 0.0]).unwrap(),
+            };
+        }
+
+        // Only i in {0, 3, 6, 9} match: 4 results even though k = 10.
+        let results = index
+            .search_filtered(&[0.0, 0.0], 10, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn test_search_filtered_no_matches_returns_empty() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        for i in 0..5 {
+            index
+                .insert_with_metadata(&[i as f32, 0.0], int_metadata("cat", 1))
+                .unwrap();
+        }
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 99i64))
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_filtered_and_conjunction() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        for i in 0..12 {
+            let mut metadata = Metadata::new();
+            metadata.insert("cat", i % 3);
+            metadata.insert("parity", i % 2);
+            index
+                .insert_with_metadata(&[i as f32, 0.0], metadata)
+                .unwrap();
+        }
+
+        let filter = Filter::And(vec![eq("cat", 1i64), eq("parity", 0i64)]);
+        let results = index.search_filtered(&[0.0, 0.0], 10, 50, &filter).unwrap();
+        // i % 3 == 1 and i % 2 == 0 for i in {4, 10} -> ids {5, 11}.
+        let ids: Vec<u64> = results.iter().map(|r| r.vector_id).collect();
+        assert_eq!(ids, vec![5, 11]);
+    }
+
+    #[test]
+    fn test_search_filtered_empty_index_errors() {
+        let (_dir, index) = setup(2, Metric::L2, 8);
+        assert!(
+            index
+                .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+                .is_err()
+        );
+        // k = 0 still validates the index state.
+        assert!(
+            index
+                .search_filtered(&[0.0, 0.0], 0, 50, &eq("cat", 1i64))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_search_filtered_dimension_mismatch() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        assert!(
+            index
+                .search_filtered(&[0.0], 5, 50, &eq("cat", 1i64))
+                .is_err()
+        );
+        // k = 0 still validates the query dimension.
+        assert!(
+            index
+                .search_filtered(&[0.0], 0, 50, &eq("cat", 1i64))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_search_filtered_k_zero_returns_empty() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        let results = index
+            .search_filtered(&[0.0, 0.0], 0, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_filtered_excludes_deleted_vectors() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        let first_id = index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        index
+            .insert_with_metadata(&[2.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+
+        index.delete(first_id).unwrap();
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results.iter().all(|r| r.vector_id != first_id));
+    }
+
+    #[test]
+    fn test_insert_with_metadata_dimension_mismatch() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        assert!(
+            index
+                .insert_with_metadata(&[1.0], int_metadata("cat", 1))
+                .is_err()
+        );
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_insert_batch_with_metadata() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        let vectors: Vec<Vec<f32>> = (0..4).map(|i| vec![i as f32, 0.0]).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let metadata = vec![
+            Some(int_metadata("cat", 0)),
+            None,
+            Some(int_metadata("cat", 2)),
+            Some(int_metadata("cat", 3)),
+        ];
+
+        let ids = index.insert_batch_with_metadata(&refs, &metadata).unwrap();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert_eq!(index.len(), 4);
+        assert_eq!(index.store.metadata(0), Some(&int_metadata("cat", 0)));
+        assert_eq!(index.store.metadata(1), None);
+        assert_eq!(index.store.metadata(2), Some(&int_metadata("cat", 2)));
+
+        // The batch-built graph must be filterable.
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 2i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, 3);
+
+        // Length mismatch must error without inserting anything.
+        assert!(
+            index
+                .insert_batch_with_metadata(&refs, &metadata[..2])
+                .is_err()
+        );
+        assert_eq!(index.len(), 4);
+    }
+
+    #[test]
+    fn test_metadata_persists_after_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_meta_persist.qvdb");
+        let wal_path = dir.path().join("hnsw_meta_persist.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 2, Metric::L2, config.clone()).unwrap();
+            for i in 0..6 {
+                index
+                    .insert_with_metadata(&[i as f32, 0.0], int_metadata("cat", i % 2))
+                    .unwrap();
+            }
+            index.flush().unwrap();
+        }
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert_eq!(index.len(), 6);
+        assert_eq!(index.store.metadata(0), Some(&int_metadata("cat", 0)));
+        assert_eq!(index.store.metadata(3), Some(&int_metadata("cat", 1)));
+
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+            .unwrap();
+        // i % 2 == 1 for i in {1, 3, 5} -> ids {2, 4, 6}, closest first.
+        let ids: Vec<u64> = results.iter().map(|r| r.vector_id).collect();
+        assert_eq!(ids, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn test_metadata_recovers_from_wal_without_flush() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("hnsw_meta_wal.qvdb");
+        let wal_path = dir.path().join("hnsw_meta_wal.wal");
+        let config = HnswConfig::new(8).with_ef_construction(50);
+
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 2, Metric::L2, config.clone()).unwrap();
+            index
+                .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+                .unwrap();
+            index.insert(&[2.0, 0.0]).unwrap();
+            // No flush: metadata must survive WAL replay alone.
+        }
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.store.metadata(0), Some(&int_metadata("cat", 1)));
+        assert_eq!(index.store.metadata(1), None);
+
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, 1);
+    }
+
+    #[test]
+    fn test_filtered_recall_across_selectivities() {
+        // Filtered recall@10 must stay high against brute-force filtered ground
+        // truth at 1%, 10%, and 50% selectivity. The adaptive over-fetch in
+        // search_filtered is what makes this hold as selectivity shrinks.
+        use rand::Rng;
+        let mut rng = rand::rng();
+
+        let dim = 32;
+        let n = 1000;
+        let k = 10;
+        let ef_search = 100;
+        let num_queries = 30;
+
+        let (_dir, mut index) = setup(dim as u32, Metric::L2, 16);
+
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+            let mut metadata = Metadata::new();
+            metadata.insert("cat100", (i % 100) as i64);
+            metadata.insert("cat10", (i % 10) as i64);
+            metadata.insert("parity", (i % 2) as i64);
+            index.insert_with_metadata(&v, metadata).unwrap();
+            vectors.push(v);
+        }
+
+        let selectivities: &[(&str, i64, f64)] = &[
+            ("cat100", 7, 0.01), // ~1% of vectors match
+            ("cat10", 3, 0.10),  // ~10%
+            ("parity", 0, 0.50), // ~50%
+        ];
+
+        for (key, value, selectivity) in selectivities {
+            let filter = eq(key, *value);
+            let mut total_recall = 0.0;
+
+            for _ in 0..num_queries {
+                let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+                // Brute-force filtered ground truth.
+                let mut ground_truth: Vec<(usize, f32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        let slot_md = index.store.metadata(*i).unwrap();
+                        filter.matches(slot_md)
+                    })
+                    .map(|(i, v)| (i, crate::distance::l2_squared(&query, v)))
+                    .collect();
+                ground_truth.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                let gt_slots: HashSet<usize> =
+                    ground_truth.iter().take(k).map(|(i, _)| *i).collect();
+
+                let results = index
+                    .search_filtered(&query, k, ef_search, &filter)
+                    .unwrap();
+
+                // Every returned vector must satisfy the filter.
+                for result in &results {
+                    assert!(
+                        index
+                            .store
+                            .metadata(result.slot)
+                            .is_some_and(|md| filter.matches(md)),
+                        "result slot {} does not satisfy the filter",
+                        result.slot
+                    );
+                }
+
+                let result_slots: HashSet<usize> = results.iter().map(|r| r.slot).collect();
+                let hits = gt_slots.intersection(&result_slots).count();
+                total_recall += hits as f64 / k as f64;
+            }
+
+            let avg_recall = total_recall / num_queries as f64;
+            assert!(
+                avg_recall > 0.90,
+                "filtered recall@{k} at {selectivity:.0}% selectivity must exceed 90%, \
+                 got {:.1}% (ef_search={ef_search}, n={n})",
+                avg_recall * 100.0
+            );
         }
     }
 }
