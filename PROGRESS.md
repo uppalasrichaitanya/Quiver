@@ -1,7 +1,8 @@
 # Quiver - Project Progress and Context Transfer
 
-> **Last updated:** 2026-08-22
+> **Last updated:** 2026-08-23
 > **Purpose:** Current implementation status and next-step context.
+> **Git:** `main` is clean and pushed to `origin` (github.com/uppalasrichaitanya/Quiver) through commit `1ba7900`.
 
 ## Architecture
 
@@ -56,7 +57,7 @@ $env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "
 1. Complete project hygiene and API lifecycle (done).
 2. HNSW diversified neighbor selection and packed 32-bit fixed-capacity adjacency are implemented and covered by unit/regression tests. The same-host SIFT1M rerun is **complete** (2026-08-22): recall at M=32/efc200/ef=100 rose 0.9595 -> 0.9961 (now above FAISS 0.9922 and hnswlib 0.9920), peak RSS fell 3.4x, build is ~1.0-1.5x slower, and search QPS regressed to ~0.77x of the July baseline. Raw JSON in `benchmarks/results/2026-08-22-i7-12650h/raw`.
 3. Closed the search-speed gap (done, 2026-08-22): `neighbors()` returns a borrowed slice, SIMD dispatch resolves once per process, the visited set is a generation-counted pool, neighbor vectors are prefetched, AVX2 kernels use four accumulators, and inserts batch into one WAL fsync per group. Re-measured on the same SIFT1M harness: at M=32/efc200/ef=100 search is now 2680 QPS / p50 0.38 ms (3.4x the July baseline, on par with FAISS/hnswlib) and build is 2.06-2.68x faster, with bit-identical recall. Raw JSON in `benchmarks/results/2026-08-22b-i7-12650h/raw` and `.../2026-08-22c-i7-12650h/raw` (the latter a cool-down rerun of the two efc=200 configs).
-4. Add metadata and filtered search, starting with post-filtering and selectivity benchmarks.
+4. **ACTIVE — Add metadata and filtered search** (plan week-14 milestone; the last missing Full-tier feature). Start with naive post-filtering + selectivity benchmarks. Storage-format study is DONE (2026-08-23); see `HANDOFF-metadata.md` for the full design brief, recommended approach, and decision points. Summary: records are fixed-size in the mmap (`[u64 id][f32 x dim]`), so metadata should NOT go inline in the hot-path record. Recommended: a `Metadata` key-value model + `Filter` predicate (`Eq`/`And`), stored in a sidecar keyed by `vector_id`, with WAL insert entries extended to carry serialized metadata (new WAL op) under a bumped data-file format version 3. Naive `search_filtered` = over-fetch from HNSW then post-filter; benchmark filtered Recall@10 at 1%/10%/50% selectivity vs brute-force ground truth. Then surface through the server (`metadata` on insert, `filter` on search/batch) and `quiver-py`.
 5. Persist SQ8 and evaluate quantized HNSW.
 6. Implement IVF-PQ only after the HNSW and filtering layers are measured and stable.
 7. Add packaging, release automation, and generated benchmark charts.
