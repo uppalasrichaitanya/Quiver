@@ -21,6 +21,7 @@ type SharedIndex = Arc<RwLock<HnswIndex>>;
 #[derive(Clone)]
 struct AppState {
     index: SharedIndex,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Deserialize)]
@@ -83,16 +84,48 @@ async fn main() {
         .await
         .expect("bind server listener");
     tracing::info!(address = %listener.local_addr().unwrap(), "Quiver server listening");
+    let index = Arc::new(RwLock::new(index));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let app = Router::new()
         .route("/health", get(health))
         .route("/vectors", post(insert))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
         .route("/vectors/{id}", delete(remove))
+        .route("/shutdown", post(shutdown_handler))
         .with_state(AppState {
-            index: Arc::new(RwLock::new(index)),
+            index: Arc::clone(&index),
+            shutdown: Arc::clone(&shutdown),
         });
-    axum::serve(listener, app).await.expect("serve HTTP API");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown))
+        .await
+        .expect("serve HTTP API");
+
+    // Persist vectors and the graph-topology snapshot so the next start reopens
+    // without rebuilding the HNSW graph.
+    match index.write().unwrap().flush() {
+        Ok(()) => tracing::info!("flushed index on shutdown"),
+        Err(e) => tracing::error!(error = %e, "failed to flush index on shutdown"),
+    }
+}
+
+async fn shutdown_signal(shutdown: Arc<tokio::sync::Notify>) {
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let notified = shutdown.notified();
+    tokio::pin!(notified);
+    tokio::select! {
+        _ = &mut ctrl_c => tracing::info!("ctrl+c received; draining connections"),
+        _ = &mut notified => tracing::info!("shutdown requested; draining connections"),
+    }
+}
+
+/// Initiates a graceful shutdown. Useful on platforms where a running server
+/// cannot receive a console Ctrl+C event (e.g. detached Windows processes).
+async fn shutdown_handler(State(state): State<AppState>) -> StatusCode {
+    state.shutdown.notify_one();
+    StatusCode::ACCEPTED
 }
 
 async fn health() -> &'static str {

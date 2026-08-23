@@ -27,16 +27,16 @@ benchmarks/     reproducible Criterion and SIFT1M comparisons
 - Axum HTTP API: health, insert, search, and delete. The server opens an existing index or creates one when paths are absent.
 - PyO3 `Index` API and semantic-search demo.
 - HNSW search/build hot-path optimizations (2026-08-22): borrowed-slice `neighbors()`, a thread-local generation-counted visited pool, neighbor prefetch, cached once-per-process SIMD dispatch, four-accumulator AVX2 distance kernels, and group-commit batch WAL inserts.
-- HNSW graph-topology snapshot persistence (2026-08-23): `flush`/`compact` write a CRC32-protected `<data>.graph` snapshot; `open` loads it and skips the rebuild when it validates against the store and config, falling back to rebuild on any mismatch or corruption.
+- HNSW graph-topology snapshot persistence (2026-08-23): `flush`/`compact` write a CRC32-protected `<data>.graph` snapshot; `open` loads it and skips the rebuild when it validates against the store and config, falling back to rebuild on any mismatch or corruption. The HTTP server flushes on graceful shutdown (Ctrl+C or `POST /shutdown`) so restarts reopen from the snapshot.
 - Server concurrency and batching (2026-08-22): `HnswIndex` is shared behind an `RwLock` (parallel reads), and a `POST /search/batch` endpoint runs multiple queries under one read lock.
 
 ## Verification Status
 
-The latest run has **108 `quiver-core` tests** and **4 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence plus the new batch-search endpoint). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing.
+The latest run has **108 `quiver-core` tests** and **5 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence, batch search, and graceful-shutdown snapshot persistence). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing.
 
 ## Known Limitations
 
-- HNSW graph topology is persisted as a snapshot on `flush`/`compact` and loaded on `open`, but vectors inserted after the last snapshot still require a rebuild on reopen (the snapshot is only as fresh as the last flush). The HTTP server does not yet call `flush`, so server restarts currently still rebuild.
+- HNSW graph topology is persisted as a snapshot on `flush`/`compact` and loaded on `open`, but vectors inserted after the last snapshot still require a rebuild on reopen (the snapshot is only as fresh as the last flush). The HTTP server flushes on graceful shutdown (Ctrl+C or `POST /shutdown`), but a hard kill still leaves the snapshot stale.
 - HNSW mutation is single-writer through `&mut self`; the server wraps it in an `RwLock` (parallel reads, exclusive writes).
 - HNSW build is slower than in-memory competitors because Quiver fsyncs a CRC32 WAL during the build, while FAISS/hnswlib build in memory and serialize afterward. Group-commit batch inserts (2026-08-22) cut build time ~2-2.7x, but the durability-during-build cost remains the gap. Search speed and recall are no longer the gap: at M=32/efc200/ef=100 Quiver now measures 2680 QPS / p50 0.38 ms / Recall@10 0.9961, on par with or above FAISS and hnswlib.
 - SQ8 is in-memory and batch-built; online recalibration and persistence are not implemented.
