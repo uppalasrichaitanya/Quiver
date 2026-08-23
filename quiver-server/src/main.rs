@@ -12,6 +12,7 @@ use axum::{
 use quiver_core::{
     distance::Metric,
     index::hnsw::{HnswConfig, HnswIndex},
+    metadata::{Filter, Metadata},
 };
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -27,6 +28,8 @@ struct AppState {
 #[derive(Deserialize)]
 struct InsertRequest {
     vector: Vec<f32>,
+    #[serde(default)]
+    metadata: Option<Metadata>,
 }
 #[derive(Serialize)]
 struct InsertResponse {
@@ -37,6 +40,8 @@ struct SearchRequest {
     vector: Vec<f32>,
     k: usize,
     ef_search: Option<usize>,
+    #[serde(default)]
+    filter: Option<Filter>,
 }
 #[derive(Deserialize)]
 struct BatchSearchRequest {
@@ -47,6 +52,8 @@ struct BatchQuery {
     vector: Vec<f32>,
     k: usize,
     ef_search: Option<usize>,
+    #[serde(default)]
+    filter: Option<Filter>,
 }
 #[derive(Serialize)]
 struct SearchHit {
@@ -136,33 +143,50 @@ async fn insert(
     State(state): State<AppState>,
     Json(request): Json<InsertRequest>,
 ) -> Result<(StatusCode, Json<InsertResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let id = state
-        .index
-        .write()
-        .unwrap()
-        .insert(&request.vector)
-        .map_err(api_error)?;
+    let mut index = state.index.write().unwrap();
+    let id = match request.metadata {
+        Some(metadata) => index.insert_with_metadata(&request.vector, metadata),
+        None => index.insert(&request.vector),
+    }
+    .map_err(api_error)?;
     Ok((StatusCode::CREATED, Json(InsertResponse { id })))
+}
+
+/// Dispatch to filtered or unfiltered search depending on whether a filter was
+/// supplied.
+fn run_search(
+    index: &HnswIndex,
+    vector: &[f32],
+    k: usize,
+    ef_search: usize,
+    filter: Option<&Filter>,
+) -> Result<Vec<SearchHit>, quiver_core::error::QuiverError> {
+    let hits = match filter {
+        Some(filter) => index.search_filtered(vector, k, ef_search, filter)?,
+        None => index.search(vector, k, ef_search)?,
+    };
+    Ok(hits
+        .into_iter()
+        .map(|hit| SearchHit {
+            id: hit.vector_id,
+            distance: hit.distance,
+        })
+        .collect())
 }
 
 async fn search(
     State(state): State<AppState>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
-    let hits = state
-        .index
-        .read()
-        .unwrap()
-        .search(&request.vector, request.k, request.ef_search.unwrap_or(100))
-        .map_err(api_error)?;
-    Ok(Json(
-        hits.into_iter()
-            .map(|hit| SearchHit {
-                id: hit.vector_id,
-                distance: hit.distance,
-            })
-            .collect(),
-    ))
+    let hits = run_search(
+        &state.index.read().unwrap(),
+        &request.vector,
+        request.k,
+        request.ef_search.unwrap_or(100),
+        request.filter.as_ref(),
+    )
+    .map_err(api_error)?;
+    Ok(Json(hits))
 }
 
 async fn search_batch(
@@ -188,17 +212,15 @@ async fn search_batch(
     let index = state.index.read().unwrap();
     let mut results = Vec::with_capacity(request.queries.len());
     for query in &request.queries {
-        let hits = index
-            .search(&query.vector, query.k, query.ef_search.unwrap_or(100))
-            .map_err(api_error)?;
-        results.push(
-            hits.into_iter()
-                .map(|hit| SearchHit {
-                    id: hit.vector_id,
-                    distance: hit.distance,
-                })
-                .collect(),
-        );
+        let hits = run_search(
+            &index,
+            &query.vector,
+            query.k,
+            query.ef_search.unwrap_or(100),
+            query.filter.as_ref(),
+        )
+        .map_err(api_error)?;
+        results.push(hits);
     }
     Ok(Json(results))
 }
