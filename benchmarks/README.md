@@ -147,6 +147,48 @@ At the headline config the rerun raises Recall@10 above both competitors
 FAISS and hnswlib. Search speed is now the primary remaining gap; recall and
 memory are no longer it.
 
+## Filtered search (metadata + `search_filtered`)
+
+Measured 2026-08-23 on the same host, single-threaded, SIFT1M (1M base,
+10k queries, L2, k=10), M=32 / efConstruction=200. Raw JSON:
+[`results/2026-08-23-i7-12650h/raw/quiver-filtered-m32-efc200.json`](results/2026-08-23-i7-12650h/raw/quiver-filtered-m32-efc200.json).
+
+Every base vector carries deterministic category metadata
+(`cat100 = position % 100`, `cat10 = position % 10`, `parity = position % 2`).
+Each selectivity scenario is an `Eq` filter on one of those keys, matching
+~1% (10,000 vectors), ~10% (100,000), or ~50% (500,000) of the corpus. Ground
+truth is brute-force scan restricted to the matching vectors — the shipped SIFT
+ground-truth file is unfiltered and unusable here. `search_filtered` is naive
+post-filtering with adaptive over-fetch: the beam starts at `max(ef_search, k)`
+and expands until `k` matches are collected or the graph is exhausted.
+
+| Selectivity | ef_search | Recall@10 | QPS | p50 ms | p99 ms |
+|---:|---:|---:|---:|---:|---:|
+| 1% | 100 | 0.9995 | 83.7 | 9.856 | 52.30 |
+| 1% | 200 | 0.9995 | 68.1 | 12.70 | 35.01 |
+| 1% | 400 | 0.9995 | 135.4 | 6.339 | 26.44 |
+| 10% | 100 | 0.9925 | 978.5 | 0.581 | 2.667 |
+| 10% | 200 | 0.9949 | 1242.7 | 0.802 | 1.474 |
+| 10% | 400 | 0.9991 | 679.8 | 1.462 | 2.664 |
+| 50% | 100 | 0.9940 | 2155.5 | 0.464 | 0.852 |
+| 50% | 200 | 0.9982 | 1045.7 | 0.869 | 3.086 |
+| 50% | 400 | 0.9991 | 688.6 | 1.464 | 2.420 |
+
+Recall stays **>= 0.992 at every selectivity and ef_search**, and is 0.9995 at
+1% because the adaptive over-fetch expands the beam until all `k` matches are
+found. The cost of naive post-filtering shows up in throughput, not recall:
+search latency grows roughly with the inverse of selectivity. At ef=100 the 50%
+case runs 2156 QPS (p50 0.46 ms) — close to the unfiltered headline (2680 QPS /
+0.38 ms) — while the 1% case drops to ~84 QPS (p50 ~9.9 ms). A filter-aware
+graph traversal is the documented next step to close the low-selectivity gap.
+
+Build for this run was 1457.5 s (vs 1144.9 s for the same config without
+metadata), the extra time going to serializing and fsyncing the per-vector
+metadata in the WAL. The metadata snapshot sidecar is 73.0 MB for 1M vectors
+(~73 bytes/vector). Peak RSS was 2013 MB, higher than the unfiltered run's
+902 MB because the benchmark also keeps a contiguous 512 MB copy of the base
+vectors resident for the brute-force ground-truth pass.
+
 ## RSS / serialized size (index growth)
 
 The clearest before/after signal for the packed-adjacency change is Quiver's
@@ -299,3 +341,17 @@ runs (build time, RSS, and per-(k, ef_search) recall/QPS/latency):
 ```bash
 python benchmarks/compare_runs.py <baseline-raw-dir> <new-raw-dir>
 ```
+
+To rerun the filtered-search benchmark (metadata + `search_filtered`, described
+in its own section below):
+
+```bash
+cargo run --release -p quiver-core --bin sift_filtered_benchmark -- \
+  --base sift_base.fvecs --queries sift_query.fvecs \
+  --work-dir <empty-dir> --output results/<date>-<host>/raw/quiver-filtered-m32-efc200.json \
+  --m 32 --ef-construction 200 --base-limit 1000000 --query-limit 10000
+```
+
+The filtered benchmark computes its own brute-force *filtered* ground truth
+(the shipped SIFT ground-truth file is unfiltered), so it takes no
+`--groundtruth` flag.

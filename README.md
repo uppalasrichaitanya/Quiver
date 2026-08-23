@@ -17,14 +17,16 @@ Implemented in `quiver-core`:
 - Scalar and hand-written x86_64 AVX2/FMA kernels for L2, dot product, and cosine distance, with runtime dispatch and scalar fallback.
 - Exact brute-force search and multi-layer HNSW insert/search/delete.
 - Batch-built SQ8 flat search with per-dimension calibration, asymmetric distance evaluation, and one-byte vector components.
+- Per-vector key-value metadata and filtered search: a `Metadata` model (`bool`/`int`/`float`/`str`), an `Eq`/`And` `Filter` predicate, durable metadata (WAL op + CRC32 snapshot sidecar, format version 3), and a `search_filtered` that post-filters HNSW candidates with adaptive over-fetch.
 - Tests comparing HNSW recall with brute-force ground truth and real subprocess-kill tests for ordinary WAL recovery and compaction recovery.
 
-The workspace includes an Axum server with insert, search, and delete endpoints, plus a PyO3 local `Index` API for the same core operations. The server accepts concurrent HTTP connections around one mutex-protected HNSW index; mutations remain serialized by the core API's single-writer model.
+The workspace includes an Axum server with insert, search, batch-search, and delete endpoints, plus a PyO3 local `Index` API for the same core operations. Insert accepts optional `metadata`, and search/batch-search accept an optional `filter`. The server accepts concurrent HTTP connections around one `RwLock`-protected HNSW index (parallel reads, exclusive writes); mutations remain serialized by the core API's single-writer model.
 
 ## Known limitations
 
-- HNSW graph topology is not persisted; reopening reconstructs the graph from stored live vectors.
-- The HNSW API is single-threaded. Mutation safety comes from Rust's `&mut self`; there is no operational single-writer/multi-reader wrapper yet.
+- HNSW graph topology is persisted as a snapshot on `flush`/`compact` and loaded on `open`, but vectors inserted after the last snapshot still require a rebuild on reopen; a hard kill leaves the snapshot stale (the server flushes on graceful shutdown).
+- The HNSW API is single-threaded. Mutation safety comes from Rust's `&mut self`; the server wraps the index in an `RwLock` (parallel reads, exclusive writes).
+- Filtered search is naive post-filtering: cost scales roughly with the inverse of filter selectivity. Recall stays >= 0.992 at 1%/10%/50% selectivity on SIFT1M, but 1% throughput is ~25x lower than 50%. Only `Eq` and `And` filters are implemented; `Or`/`In`/range are deferred, and metadata is immutable after insert.
 - SQ8 is currently an in-memory, batch-built index; online recalibration and persistence are not implemented. IVF-PQ remains planned.
 - Benchmark evidence, including reproducible SIFT1M comparisons and scalar/SIMD Criterion results, is documented in `benchmarks/`. A sampling flamegraph remains unavailable after the documented `samply` install attempt.
 - The crates have not yet been released to crates.io or PyPI.
@@ -86,8 +88,9 @@ $env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "
 
 Axum was temporarily removed in an earlier commit because `C:\MinGW\bin\dlltool.exe` was selected and failed to create 64-bit import libraries with `Invalid bfd target`. That was a PATH/toolchain conflict, not an Axum or Tokio limitation. Axum is restored, and the server now opens an existing index on restart or creates one when the configured data path does not exist.
 
-The server exposes `POST /vectors`, `POST /search`, and
-`DELETE /vectors/{id}`. A local native Python API is also available through
+The server exposes `POST /vectors` (optional `metadata`), `POST /search` and
+`POST /search/batch` (both with an optional `filter`), `DELETE /vectors/{id}`,
+and `POST /shutdown`. A local native Python API is also available through
 [`quiver-py`](quiver-py/README.md).
 
 ![Quiver semantic-search terminal demo](examples/semantic-search-demo.gif)
