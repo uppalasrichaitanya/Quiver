@@ -6,7 +6,7 @@
 //! Offset  Size  Field
 //! ------  ----  -----
 //! 0       4     Magic bytes: b"QVDB"
-//! 4       1     Format version (currently 2)
+//! 4       1     Format version (currently 3)
 //! 5       1     Metric type (0 = L2, 1 = DotProduct, 2 = Cosine)
 //! 6       2     Reserved (padding, zeroed)
 //! 8       4     Vector dimension (u32, little-endian)
@@ -19,6 +19,11 @@
 //!
 //! The version byte is present from day one so format changes later
 //! (e.g., metadata support) don't break old indexes.
+//!
+//! Version 3 records are byte-identical to version 2; the bump signals that
+//! vectors may carry metadata (persisted out-of-band in the WAL and a `.meta`
+//! snapshot, never inline in the fixed-size records). Binaries predating
+//! metadata reject version 3 via the version check below.
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -32,8 +37,9 @@ pub const MAGIC: &[u8; 4] = b"QVDB";
 /// Legacy format with raw f32 records and implicit `slot + 1` vector IDs.
 pub const LEGACY_FORMAT_VERSION: u8 = 1;
 
-/// Current format with an explicit u64 vector ID at the start of each record.
-pub const FORMAT_VERSION: u8 = 2;
+/// Current format: explicit u64 vector ID at the start of each record, plus
+/// (since version 3) optional per-vector metadata stored out-of-band.
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Total size of the file header in bytes.
 pub const HEADER_SIZE: usize = 64;
@@ -204,6 +210,20 @@ mod tests {
         bytes[4] = LEGACY_FORMAT_VERSION;
         let header = FileHeader::from_bytes(&bytes).unwrap();
         assert_eq!(header.version, LEGACY_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn test_version_2_is_still_accepted() {
+        let mut bytes = FileHeader::new(128, Metric::L2).to_bytes();
+        bytes[4] = 2;
+        let header = FileHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(header.version, 2);
+    }
+
+    #[test]
+    fn test_new_headers_are_version_3() {
+        assert_eq!(FORMAT_VERSION, 3);
+        assert_eq!(FileHeader::new(128, Metric::L2).version, 3);
     }
 
     #[test]

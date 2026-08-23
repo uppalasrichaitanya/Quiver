@@ -26,7 +26,7 @@ fn mutated_valid_file(input: &[u8], version: u8) -> Vec<u8> {
     file[8..12].copy_from_slice(&2_u32.to_le_bytes());
     file[12..20].copy_from_slice(&1_u64.to_le_bytes());
     file[20..28].copy_from_slice(&1_u64.to_le_bytes());
-    if version == 2 {
+    if version >= 2 {
         file.extend_from_slice(&1_u64.to_le_bytes());
     }
     file.extend_from_slice(&1.0_f32.to_le_bytes());
@@ -48,9 +48,10 @@ fuzz_target!(|data: &[u8]| {
         let _ = validate_file_bytes(&data[..truncated_at]);
     }
 
-    // Force both supported version markers while leaving dimension, count,
-    // max-ID, record bytes, and offsets under fuzzer control.
-    for version in [1_u8, 2_u8] {
+    // Force every supported version marker while leaving dimension, count,
+    // max-ID, record bytes, and offsets under fuzzer control. Versions 2 and
+    // 3 share the same record layout (v3 only adds out-of-band metadata).
+    for version in [1_u8, 2_u8, 3_u8] {
         let candidate = synthesized_file(data, version);
         let _ = validate_file_bytes(&candidate);
 

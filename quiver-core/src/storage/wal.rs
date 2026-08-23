@@ -8,11 +8,20 @@
 //! Offset  Size       Field
 //! ------  ---------  -----
 //! 0       4          Entry length in bytes (u32 LE, excludes this field and checksum)
-//! 4       1          Operation type (0 = Insert, 1 = Delete)
+//! 4       1          Operation type (0 = Insert, 1 = Delete, 2 = InsertMeta)
 //! 5       8          Vector ID (u64 LE)
-//! 13      N*4        Vector data (N f32s, LE) — only present for Insert ops
-//! 13+N*4  4          CRC32 checksum of bytes [0..13+N*4)
+//! 13      ...        Operation payload:
+//!                    - Insert: N*4 bytes of vector data (N f32s, LE)
+//!                    - Delete: none
+//!                    - InsertMeta: metadata length (u32 LE) + metadata bytes
+//!                      (see `Metadata::to_bytes`) + vector data (N f32s, LE)
+//! end     4          CRC32 checksum of the length prefix + body
 //! ```
+//!
+//! `InsertMeta` (op 2) carries metadata alongside the vector. It is a new op
+//! code rather than an extension of `Insert` so the `Insert` payload stays a
+//! pure f32 tail; pre-metadata binaries never reach it because they reject
+//! version-3 data files before reading the WAL.
 //!
 //! ## Recovery
 //!
@@ -28,6 +37,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::metadata::Metadata;
 
 /// The type of operation recorded in a WAL entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +47,8 @@ pub enum WalOp {
     Insert = 0,
     /// Delete the vector with the given ID.
     Delete = 1,
+    /// Insert a vector with the given ID, metadata, and data.
+    InsertMeta = 2,
 }
 
 impl WalOp {
@@ -44,6 +56,7 @@ impl WalOp {
         match v {
             0 => Some(WalOp::Insert),
             1 => Some(WalOp::Delete),
+            2 => Some(WalOp::InsertMeta),
             _ => None,
         }
     }
@@ -56,8 +69,10 @@ pub struct WalEntry {
     pub op: WalOp,
     /// The vector ID this operation applies to.
     pub vector_id: u64,
-    /// The vector data (only present for Insert operations).
+    /// The vector data (present for Insert and InsertMeta operations).
     pub vector_data: Option<Vec<f32>>,
+    /// The metadata (present only for InsertMeta operations).
+    pub metadata: Option<Metadata>,
 }
 
 /// The Write-Ahead Log writer/reader.
@@ -80,6 +95,18 @@ impl Wal {
     /// Append an insert entry to the WAL.
     pub fn log_insert(&mut self, vector_id: u64, data: &[f32]) -> Result<()> {
         let entry_body = Self::serialize_insert(vector_id, data);
+        self.write_entry(&entry_body)?;
+        Ok(())
+    }
+
+    /// Append an insert entry with metadata to the WAL.
+    pub fn log_insert_meta(
+        &mut self,
+        vector_id: u64,
+        metadata: &Metadata,
+        data: &[f32],
+    ) -> Result<()> {
+        let entry_body = Self::serialize_insert_meta(vector_id, metadata, data);
         self.write_entry(&entry_body)?;
         Ok(())
     }
@@ -239,6 +266,20 @@ impl Wal {
         buf
     }
 
+    fn serialize_insert_meta(vector_id: u64, metadata: &Metadata, data: &[f32]) -> Vec<u8> {
+        let meta_bytes = metadata.to_bytes();
+        let mut buf = Vec::with_capacity(1 + 8 + 4 + meta_bytes.len() + data.len() * 4);
+        buf.write_u8(WalOp::InsertMeta as u8).unwrap();
+        buf.write_u64::<LittleEndian>(vector_id).unwrap();
+        buf.write_u32::<LittleEndian>(meta_bytes.len() as u32)
+            .unwrap();
+        buf.write_all(&meta_bytes).unwrap();
+        for &val in data {
+            buf.write_f32::<LittleEndian>(val).unwrap();
+        }
+        buf
+    }
+
     fn serialize_delete(vector_id: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + 8);
         buf.write_u8(WalOp::Delete as u8).unwrap();
@@ -274,12 +315,40 @@ impl Wal {
                     op,
                     vector_id,
                     vector_data: Some(data),
+                    metadata: None,
+                })
+            }
+            WalOp::InsertMeta => {
+                let remaining = &body[9..];
+                let mut cursor = io::Cursor::new(remaining);
+                let meta_len = usize::try_from(cursor.read_u32::<LittleEndian>().ok()?)
+                    .ok()?
+                    .checked_add(4)?;
+                if remaining.len() < meta_len {
+                    return None; // Metadata blob truncated
+                }
+                let metadata = Metadata::from_bytes(&remaining[4..meta_len]).ok()?;
+                let vector_bytes = &remaining[meta_len..];
+                if !vector_bytes.len().is_multiple_of(4) {
+                    return None; // Not aligned to f32
+                }
+                let mut data = Vec::with_capacity(vector_bytes.len() / 4);
+                let mut cursor = io::Cursor::new(vector_bytes);
+                while cursor.position() < vector_bytes.len() as u64 {
+                    data.push(cursor.read_f32::<LittleEndian>().ok()?);
+                }
+                Some(WalEntry {
+                    op,
+                    vector_id,
+                    vector_data: Some(data),
+                    metadata: Some(metadata),
                 })
             }
             WalOp::Delete => Some(WalEntry {
                 op,
                 vector_id,
                 vector_data: None,
+                metadata: None,
             }),
         }
     }
@@ -446,5 +515,158 @@ mod tests {
         let (entries, valid_up_to) = Wal::read_entries(&path).unwrap();
         assert!(entries.is_empty());
         assert_eq!(valid_up_to, 0);
+    }
+
+    fn sample_metadata() -> Metadata {
+        let mut metadata = Metadata::new();
+        metadata.insert("category", "science");
+        metadata.insert("year", 2024i64);
+        metadata
+    }
+
+    #[test]
+    fn test_wal_insert_meta_and_read() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_insert_meta(1, &sample_metadata(), &[1.0, 2.0, 3.0])
+                .unwrap();
+            wal.log_insert(2, &[4.0, 5.0]).unwrap();
+            wal.flush().unwrap();
+        }
+
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, WalOp::InsertMeta);
+        assert_eq!(entries[0].vector_id, 1);
+        assert_eq!(entries[0].vector_data.as_ref().unwrap(), &[1.0, 2.0, 3.0]);
+        assert_eq!(entries[0].metadata.as_ref().unwrap(), &sample_metadata());
+        assert_eq!(entries[1].op, WalOp::Insert);
+        assert!(entries[1].metadata.is_none());
+    }
+
+    #[test]
+    fn test_wal_insert_meta_empty_metadata_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_insert_meta(1, &Metadata::new(), &[9.0]).unwrap();
+            wal.flush().unwrap();
+        }
+
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].metadata.as_ref().unwrap(), &Metadata::new());
+        assert_eq!(entries[0].vector_data.as_ref().unwrap(), &[9.0]);
+    }
+
+    /// Append an entry with a valid CRC around an arbitrary body, so tests can
+    /// exercise parse-level rejection independently of checksum rejection.
+    fn append_raw_entry(path: &Path, body: &[u8]) {
+        let mut hasher = Hasher::new();
+        let mut len_bytes = Vec::with_capacity(4);
+        len_bytes
+            .write_u32::<LittleEndian>(body.len() as u32)
+            .unwrap();
+        hasher.update(&len_bytes);
+        hasher.update(body);
+        let checksum = hasher.finalize();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&len_bytes).unwrap();
+        file.write_all(body).unwrap();
+        file.write_u32::<LittleEndian>(checksum).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn test_wal_insert_meta_oversized_meta_len_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        // op=2, id=1, meta_len=100 but only a few bytes follow.
+        let mut body = Vec::new();
+        body.write_u8(WalOp::InsertMeta as u8).unwrap();
+        body.write_u64::<LittleEndian>(1).unwrap();
+        body.write_u32::<LittleEndian>(100).unwrap();
+        body.extend_from_slice(&[0u8; 5]);
+        append_raw_entry(&path, &body);
+
+        let (entries, valid_up_to) = Wal::read_entries(&path).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(valid_up_to, 0);
+    }
+
+    #[test]
+    fn test_wal_insert_meta_corrupt_metadata_blob_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        // Valid framing and CRC, but the metadata blob itself is garbage.
+        let garbage_meta = [0xFFu8; 6];
+        let mut body = Vec::new();
+        body.write_u8(WalOp::InsertMeta as u8).unwrap();
+        body.write_u64::<LittleEndian>(1).unwrap();
+        body.write_u32::<LittleEndian>(garbage_meta.len() as u32)
+            .unwrap();
+        body.extend_from_slice(&garbage_meta);
+        body.write_f32::<LittleEndian>(1.0).unwrap();
+        append_raw_entry(&path, &body);
+
+        let (entries, valid_up_to) = Wal::read_entries(&path).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(valid_up_to, 0);
+    }
+
+    #[test]
+    fn test_wal_insert_meta_misaligned_vector_tail_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        let meta = Metadata::new().to_bytes();
+        let mut body = Vec::new();
+        body.write_u8(WalOp::InsertMeta as u8).unwrap();
+        body.write_u64::<LittleEndian>(1).unwrap();
+        body.write_u32::<LittleEndian>(meta.len() as u32).unwrap();
+        body.extend_from_slice(&meta);
+        body.extend_from_slice(&[0u8; 3]); // not a multiple of 4
+        append_raw_entry(&path, &body);
+
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_wal_insert_meta_checksum_corruption_truncates() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_insert(1, &[1.0]).unwrap();
+            wal.log_insert_meta(2, &sample_metadata(), &[2.0]).unwrap();
+            wal.flush().unwrap();
+        }
+
+        // Corrupt the final byte (inside the second entry's checksum).
+        {
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            file.seek(SeekFrom::Start(len - 1)).unwrap();
+            file.write_all(&[0xFF]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].vector_id, 1);
     }
 }

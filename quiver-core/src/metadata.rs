@@ -16,8 +16,20 @@
 //! empty `And` matches everything.
 
 use std::collections::BTreeMap;
+use std::io::{Cursor, Write};
 
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{QuiverError, Result};
+
+/// Current version of the binary metadata encoding (see [`Metadata::to_bytes`]).
+pub const METADATA_ENCODING_VERSION: u8 = 1;
+
+const TAG_BOOL: u8 = 0;
+const TAG_INT: u8 = 1;
+const TAG_FLOAT: u8 = 2;
+const TAG_STR: u8 = 3;
 
 /// A scalar metadata value attached to a vector.
 ///
@@ -113,6 +125,143 @@ impl Metadata {
     /// Iterate over key-value pairs in sorted key order.
     pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, MetaValue> {
         self.0.iter()
+    }
+
+    /// Serialize to the versioned binary encoding used by the WAL and the
+    /// metadata snapshot.
+    ///
+    /// ```text
+    /// [u8 version][u32 entry_count]
+    /// per entry (sorted by key):
+    ///   [u32 key_len][key UTF-8][u8 value tag][value payload]
+    ///   tags: 0 = bool [u8], 1 = int [i64 LE], 2 = float [f64 LE],
+    ///         3 = str [u32 len][bytes]
+    /// ```
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_u8(METADATA_ENCODING_VERSION).unwrap();
+        buf.write_u32::<LittleEndian>(self.0.len() as u32).unwrap();
+        for (key, value) in &self.0 {
+            buf.write_u32::<LittleEndian>(key.len() as u32).unwrap();
+            buf.write_all(key.as_bytes()).unwrap();
+            match value {
+                MetaValue::Bool(b) => {
+                    buf.write_u8(TAG_BOOL).unwrap();
+                    buf.write_u8(u8::from(*b)).unwrap();
+                }
+                MetaValue::Int(i) => {
+                    buf.write_u8(TAG_INT).unwrap();
+                    buf.write_i64::<LittleEndian>(*i).unwrap();
+                }
+                MetaValue::Float(f) => {
+                    buf.write_u8(TAG_FLOAT).unwrap();
+                    buf.write_f64::<LittleEndian>(*f).unwrap();
+                }
+                MetaValue::Str(s) => {
+                    buf.write_u8(TAG_STR).unwrap();
+                    buf.write_u32::<LittleEndian>(s.len() as u32).unwrap();
+                    buf.write_all(s.as_bytes()).unwrap();
+                }
+            }
+        }
+        buf
+    }
+
+    /// Parse the binary encoding produced by [`Metadata::to_bytes`].
+    ///
+    /// Bounds-checked throughout: malformed input returns an error rather than
+    /// panicking or allocating unbounded memory.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let invalid = |message: String| QuiverError::InvalidFormat(message);
+
+        let mut cursor = Cursor::new(bytes);
+        let version = cursor
+            .read_u8()
+            .map_err(|_| invalid("metadata blob too short".to_string()))?;
+        if version != METADATA_ENCODING_VERSION {
+            return Err(invalid(format!(
+                "unsupported metadata encoding version: {version}"
+            )));
+        }
+        let entry_count = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|_| invalid("metadata blob missing entry count".to_string()))?;
+
+        let mut map = BTreeMap::new();
+        for _ in 0..entry_count {
+            let key_len = cursor
+                .read_u32::<LittleEndian>()
+                .ok()
+                .and_then(|len| usize::try_from(len).ok())
+                .ok_or_else(|| invalid("metadata key length invalid".to_string()))?;
+            let start = usize::try_from(cursor.position())
+                .ok()
+                .and_then(|pos| pos.checked_add(key_len))
+                .ok_or_else(|| invalid("metadata key length overflow".to_string()))?;
+            let key_bytes = bytes
+                .get(cursor.position() as usize..start)
+                .ok_or_else(|| invalid("metadata key truncated".to_string()))?;
+            let key = std::str::from_utf8(key_bytes)
+                .map_err(|_| invalid("metadata key is not valid UTF-8".to_string()))?
+                .to_owned();
+            cursor.set_position(start as u64);
+
+            let tag = cursor
+                .read_u8()
+                .map_err(|_| invalid("metadata value tag truncated".to_string()))?;
+            let value = match tag {
+                TAG_BOOL => {
+                    let byte = cursor
+                        .read_u8()
+                        .map_err(|_| invalid("metadata bool value truncated".to_string()))?;
+                    match byte {
+                        0 => MetaValue::Bool(false),
+                        1 => MetaValue::Bool(true),
+                        _ => return Err(invalid(format!("invalid metadata bool byte: {byte}"))),
+                    }
+                }
+                TAG_INT => MetaValue::Int(
+                    cursor
+                        .read_i64::<LittleEndian>()
+                        .map_err(|_| invalid("metadata int value truncated".to_string()))?,
+                ),
+                TAG_FLOAT => MetaValue::Float(
+                    cursor
+                        .read_f64::<LittleEndian>()
+                        .map_err(|_| invalid("metadata float value truncated".to_string()))?,
+                ),
+                TAG_STR => {
+                    let str_len = cursor
+                        .read_u32::<LittleEndian>()
+                        .ok()
+                        .and_then(|len| usize::try_from(len).ok())
+                        .ok_or_else(|| invalid("metadata string length invalid".to_string()))?;
+                    let start = usize::try_from(cursor.position())
+                        .ok()
+                        .and_then(|pos| pos.checked_add(str_len))
+                        .ok_or_else(|| invalid("metadata string length overflow".to_string()))?;
+                    let str_bytes = bytes
+                        .get(cursor.position() as usize..start)
+                        .ok_or_else(|| invalid("metadata string value truncated".to_string()))?;
+                    let value = std::str::from_utf8(str_bytes)
+                        .map_err(|_| invalid("metadata string is not valid UTF-8".to_string()))?
+                        .to_owned();
+                    cursor.set_position(start as u64);
+                    MetaValue::Str(value)
+                }
+                _ => return Err(invalid(format!("unknown metadata value tag: {tag}"))),
+            };
+
+            if map.insert(key, value).is_some() {
+                return Err(invalid("duplicate metadata key".to_string()));
+            }
+        }
+
+        if cursor.position() as usize != bytes.len() {
+            return Err(invalid("trailing bytes after metadata blob".to_string()));
+        }
+
+        Ok(Self(map))
     }
 }
 
@@ -266,6 +415,102 @@ mod tests {
         md.insert("mango", 3i64);
         let keys: Vec<&str> = md.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["apple", "mango", "zebra"]);
+    }
+
+    #[test]
+    fn test_binary_roundtrip_all_value_types() {
+        let mut md = Metadata::new();
+        md.insert("bool", true);
+        md.insert("int", -42i64);
+        md.insert("float", 2.5f64);
+        md.insert("str", "hello wörld");
+        md.insert("empty_str", "");
+
+        let bytes = md.to_bytes();
+        let parsed = Metadata::from_bytes(&bytes).unwrap();
+        assert_eq!(md, parsed);
+    }
+
+    #[test]
+    fn test_binary_roundtrip_empty_metadata() {
+        let md = Metadata::new();
+        let bytes = md.to_bytes();
+        assert_eq!(bytes, vec![METADATA_ENCODING_VERSION, 0, 0, 0, 0]);
+        assert_eq!(Metadata::from_bytes(&bytes).unwrap(), md);
+    }
+
+    #[test]
+    fn test_binary_from_bytes_rejects_malformed_input() {
+        let valid = sample_metadata().to_bytes();
+
+        // Every truncated prefix must error, never panic.
+        for len in 0..valid.len() {
+            assert!(
+                Metadata::from_bytes(&valid[..len]).is_err(),
+                "prefix of length {len} unexpectedly parsed"
+            );
+        }
+
+        // Empty input, unknown version, unknown tag, trailing garbage.
+        assert!(Metadata::from_bytes(&[]).is_err());
+        let mut bad_version = valid.clone();
+        bad_version[0] = 99;
+        assert!(Metadata::from_bytes(&bad_version).is_err());
+        let mut bad_tag = valid.clone();
+        // The last entry is an Int: tag byte sits 9 bytes before the end
+        // (1 tag + 8 payload).
+        let tag_pos = bad_tag.len() - 9;
+        bad_tag[tag_pos] = 77;
+        assert!(Metadata::from_bytes(&bad_tag).is_err());
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(Metadata::from_bytes(&trailing).is_err());
+    }
+
+    #[test]
+    fn test_binary_from_bytes_rejects_invalid_bool_byte() {
+        let md = {
+            let mut md = Metadata::new();
+            md.insert("b", true);
+            md
+        };
+        let mut bytes = md.to_bytes();
+        // Layout: version(1) count(4) key_len(4) "b"(1) tag(1) bool(1).
+        *bytes.last_mut().unwrap() = 2;
+        assert!(Metadata::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_binary_from_bytes_rejects_non_utf8_key() {
+        let mut bytes = vec![METADATA_ENCODING_VERSION];
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // one entry
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // key length 1
+        bytes.push(0xFF); // invalid UTF-8
+        bytes.push(TAG_INT);
+        bytes.extend_from_slice(&0_i64.to_le_bytes());
+        assert!(Metadata::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_binary_from_bytes_rejects_duplicate_keys() {
+        let mut bytes = vec![METADATA_ENCODING_VERSION];
+        bytes.extend_from_slice(&2_u32.to_le_bytes()); // two entries
+        for _ in 0..2 {
+            bytes.extend_from_slice(&1_u32.to_le_bytes()); // key length 1
+            bytes.extend_from_slice(b"k");
+            bytes.push(TAG_INT);
+            bytes.extend_from_slice(&0_i64.to_le_bytes());
+        }
+        assert!(Metadata::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_binary_from_bytes_absurd_length_does_not_allocate() {
+        // key_len = u32::MAX with no key bytes present must fail fast.
+        let mut bytes = vec![METADATA_ENCODING_VERSION];
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Metadata::from_bytes(&bytes).is_err());
     }
 
     #[test]
