@@ -1,0 +1,179 @@
+{
+  "engine": "quiver",
+  "engine_version": "0.1.0",
+  "dataset": "SIFT1M",
+  "benchmark": "filtered-search",
+  "dimension": 128,
+  "base_vectors": 1000000,
+  "queries": 10000,
+  "thread_count": 1,
+  "random_seed": 42,
+  "m": 32,
+  "ef_construction": 200,
+  "metadata_scheme": "cat100 = position % 100, cat10 = position % 10, parity = position % 2 (0-based insert position); all values stored as integers",
+  "build_seconds": 1109.9835793,
+  "ground_truth_seconds": 288.590091,
+  "baseline_rss_bytes": 10772480,
+  "rss_after_build_bytes": 1503522816,
+  "index_rss_delta_bytes": 1492750336,
+  "peak_rss_bytes": 2040422400,
+  "data_file_bytes": 546308096,
+  "wal_file_bytes": 594000000,
+  "meta_file_bytes": 73000040,
+  "insert_durability": "CRC32 WAL records group-committed (one fsync per batch) before acknowledgment",
+  "filtered_search": [
+    {
+      "selectivity": "1%",
+      "filter": {
+        "Eq": {
+          "key": "cat100",
+          "value": 7
+        }
+      },
+      "matching_vectors": 10000,
+      "k": 10,
+      "ef_search": 100,
+      "recall": 0.9982599999999969,
+      "qps": 195.22960558572987,
+      "p50_latency_ms": 4.5107,
+      "p99_latency_ms": 12.7375,
+      "total_seconds": 51.2217395
+    },
+    {
+      "selectivity": "1%",
+      "filter": {
+        "Eq": {
+          "key": "cat100",
+          "value": 7
+        }
+      },
+      "matching_vectors": 10000,
+      "k": 10,
+      "ef_search": 200,
+      "recall": 0.9982599999999969,
+      "qps": 222.64590005311996,
+      "p50_latency_ms": 3.8674,
+      "p99_latency_ms": 12.4578,
+      "total_seconds": 44.9143685
+    },
+    {
+      "selectivity": "1%",
+      "filter": {
+        "Eq": {
+          "key": "cat100",
+          "value": 7
+        }
+      },
+      "matching_vectors": 10000,
+      "k": 10,
+      "ef_search": 400,
+      "recall": 0.9982699999999968,
+      "qps": 322.1825366723064,
+      "p50_latency_ms": 3.0231,
+      "p99_latency_ms": 5.9158,
+      "total_seconds": 31.0383055
+    },
+    {
+      "selectivity": "10%",
+      "filter": {
+        "Eq": {
+          "key": "cat10",
+          "value": 3
+        }
+      },
+      "matching_vectors": 100000,
+      "k": 10,
+      "ef_search": 100,
+      "recall": 0.9837399999999796,
+      "qps": 2001.6978401079798,
+      "p50_latency_ms": 0.4977,
+      "p99_latency_ms": 0.8913,
+      "total_seconds": 4.995759
+    },
+    {
+      "selectivity": "10%",
+      "filter": {
+        "Eq": {
+          "key": "cat10",
+          "value": 3
+        }
+      },
+      "matching_vectors": 100000,
+      "k": 10,
+      "ef_search": 200,
+      "recall": 0.9947799999999928,
+      "qps": 1279.025484902543,
+      "p50_latency_ms": 0.8041,
+      "p99_latency_ms": 1.1841,
+      "total_seconds": 7.8184525
+    },
+    {
+      "selectivity": "10%",
+      "filter": {
+        "Eq": {
+          "key": "cat10",
+          "value": 3
+        }
+      },
+      "matching_vectors": 100000,
+      "k": 10,
+      "ef_search": 400,
+      "recall": 0.9991399999999989,
+      "qps": 700.4889588054702,
+      "p50_latency_ms": 1.4587,
+      "p99_latency_ms": 2.2908,
+      "total_seconds": 14.2757425
+    },
+    {
+      "selectivity": "50%",
+      "filter": {
+        "Eq": {
+          "key": "parity",
+          "value": 0
+        }
+      },
+      "matching_vectors": 500000,
+      "k": 10,
+      "ef_search": 100,
+      "recall": 0.9939699999999917,
+      "qps": 2124.421143037998,
+      "p50_latency_ms": 0.48,
+      "p99_latency_ms": 0.7846,
+      "total_seconds": 4.7071646000000005
+    },
+    {
+      "selectivity": "50%",
+      "filter": {
+        "Eq": {
+          "key": "parity",
+          "value": 0
+        }
+      },
+      "matching_vectors": 500000,
+      "k": 10,
+      "ef_search": 200,
+      "recall": 0.998139999999997,
+      "qps": 1236.6237653440123,
+      "p50_latency_ms": 0.8288,
+      "p99_latency_ms": 1.3059,
+      "total_seconds": 8.0865339
+    },
+    {
+      "selectivity": "50%",
+      "filter": {
+        "Eq": {
+          "key": "parity",
+          "value": 0
+        }
+      },
+      "matching_vectors": 500000,
+      "k": 10,
+      "ef_search": 400,
+      "recall": 0.9990399999999984,
+      "qps": 706.0542813119364,
+      "p50_latency_ms": 1.4511,
+      "p99_latency_ms": 2.2639,
+      "total_seconds": 14.163217
+    }
+  ]
+}
