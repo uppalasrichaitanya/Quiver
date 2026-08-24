@@ -392,16 +392,14 @@ impl HnswIndex {
 
     /// Search for the `k` nearest neighbors whose metadata matches `filter`.
     ///
-    /// Naive post-filtering: candidates are over-fetched from the graph, then
-    /// filtered. Because the required over-fetch grows as selectivity shrinks,
-    /// the beam width starts at `max(ef_search, k)` and expands adaptively
-    /// until `k` matches are collected or the graph is exhausted. Vectors
-    /// without metadata never match. Fewer than `k` results are returned when
-    /// fewer than `k` vectors match.
-    ///
-    /// Cost therefore scales roughly with the inverse of filter selectivity —
-    /// the known limitation of post-filtering, and the motivation for a future
-    /// filter-aware traversal.
+    /// Filter-aware traversal: a single best-first pass over layer 0 explores
+    /// matching and non-matching nodes alike as waypoints, keeping the `k`
+    /// closest matching nodes seen so far. The search expands at least
+    /// `max(ef_search, k)` nodes, then stops once the closest unexpanded node
+    /// is farther than the farthest kept match — best-first order means no
+    /// closer match is reachable without passing through an already-farther
+    /// node. Vectors without metadata never match. Fewer than `k` results are
+    /// returned when fewer than `k` vectors match (the frontier exhausts).
     pub fn search_filtered(
         &self,
         query: &[f32],
@@ -409,34 +407,38 @@ impl HnswIndex {
         ef_search: usize,
         filter: &Filter,
     ) -> Result<Vec<SearchResult>> {
+        if query.len() != self.store.dimension() as usize {
+            return Err(QuiverError::DimensionMismatch {
+                expected: self.store.dimension(),
+                actual: query.len() as u32,
+            });
+        }
+
+        let entry_point = match self.entry_point {
+            Some(ep) => ep,
+            None => return Err(QuiverError::EmptyIndex),
+        };
+
         if k == 0 {
-            // Still validate the query and index state before returning empty.
-            self.search_candidates(query, 1)?;
             return Ok(Vec::new());
         }
 
-        let total = self.total_nodes();
-        let mut ef = ef_search.max(k).min(total).max(1);
-        loop {
-            let candidates = self.search_candidates(query, ef)?;
-            let mut matches: Vec<SearchResult> = candidates
-                .into_iter()
-                .filter(|result| {
-                    self.store
-                        .metadata(result.slot)
-                        .is_some_and(|metadata| filter.matches(metadata))
-                })
-                .collect();
-            if matches.len() >= k || ef >= total {
-                matches.truncate(k);
-                return Ok(matches);
-            }
-            ef = ef.saturating_mul(4).min(total);
-        }
+        let metric = self.store.metric();
+        let entry = self.greedy_descent(query, entry_point, metric);
+        let matches = self.search_layer_filtered(query, entry, k, ef_search.max(k), metric, filter);
+
+        Ok(matches
+            .into_iter()
+            .map(|c| SearchResult {
+                slot: self.nodes[c.node_idx].slot,
+                vector_id: self.nodes[c.node_idx].vector_id,
+                distance: c.distance,
+            })
+            .collect())
     }
 
-    /// Shared core of [`Self::search`] and [`Self::search_filtered`]: return up
-    /// to `ef` non-deleted results sorted by distance (closest first).
+    /// Shared core of [`Self::search`]: return up to `ef` non-deleted results
+    /// sorted by distance (closest first).
     fn search_candidates(&self, query: &[f32], ef: usize) -> Result<Vec<SearchResult>> {
         if query.len() != self.store.dimension() as usize {
             return Err(QuiverError::DimensionMismatch {
@@ -451,37 +453,8 @@ impl HnswIndex {
         };
 
         // Phase 1: Greedy descent from the entry point through upper layers
-        let mut current = entry_point;
         let metric = self.store.metric();
-
-        let ep_vector = self.store.get_vector_unchecked(self.nodes[current].slot);
-        let mut current_dist = compute_distance(query, ep_vector, metric);
-
-        for level in (1..=self.max_level).rev() {
-            let mut changed = true;
-            while changed {
-                changed = false;
-                if level > self.nodes[current].max_layer {
-                    break;
-                }
-                let neighbors = self.neighbors(current, level);
-                for &neighbor_link in neighbors {
-                    let neighbor_idx = neighbor_link as usize;
-                    if self.nodes[neighbor_idx].deleted {
-                        continue;
-                    }
-                    let neighbor_vec = self
-                        .store
-                        .get_vector_unchecked(self.nodes[neighbor_idx].slot);
-                    let dist = compute_distance(query, neighbor_vec, metric);
-                    if dist < current_dist {
-                        current = neighbor_idx;
-                        current_dist = dist;
-                        changed = true;
-                    }
-                }
-            }
-        }
+        let current = self.greedy_descent(query, entry_point, metric);
 
         // Phase 2: Beam search at layer 0 with ef candidates
         let candidates = self.search_layer(query, current, ef, 0, metric);
@@ -1053,6 +1026,43 @@ impl HnswIndex {
         }
     }
 
+    /// Greedy descent from the entry point through the upper layers (phase 1
+    /// of search). Returns the closest node found, which lives on layer 0.
+    fn greedy_descent(&self, query: &[f32], entry_point: usize, metric: Metric) -> usize {
+        let mut current = entry_point;
+
+        let ep_vector = self.store.get_vector_unchecked(self.nodes[current].slot);
+        let mut current_dist = compute_distance(query, ep_vector, metric);
+
+        for level in (1..=self.max_level).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                if level > self.nodes[current].max_layer {
+                    break;
+                }
+                let neighbors = self.neighbors(current, level);
+                for &neighbor_link in neighbors {
+                    let neighbor_idx = neighbor_link as usize;
+                    if self.nodes[neighbor_idx].deleted {
+                        continue;
+                    }
+                    let neighbor_vec = self
+                        .store
+                        .get_vector_unchecked(self.nodes[neighbor_idx].slot);
+                    let dist = compute_distance(query, neighbor_vec, metric);
+                    if dist < current_dist {
+                        current = neighbor_idx;
+                        current_dist = dist;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        current
+    }
+
     /// Beam search at a given layer. Returns candidates sorted by distance (closest first).
     fn search_layer(
         &self,
@@ -1150,6 +1160,127 @@ impl HnswIndex {
         let mut sorted: Vec<Candidate> = results.into_vec();
         sorted.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
         sorted
+    }
+
+    /// Filter-aware beam search at layer 0. Returns up to `k` matching,
+    /// non-deleted candidates sorted by distance (closest first).
+    ///
+    /// Unlike [`Self::search_layer`], the frontier uses non-matching nodes as
+    /// waypoints too, while a separate max-heap tracks the `k` closest
+    /// matching nodes. Expansion stops once at least `ef` nodes have been
+    /// expanded, `k` matches are in hand, and the closest unexpanded node is
+    /// farther than the farthest kept match; neighbors that can no longer
+    /// affect the outcome are never pushed onto the frontier.
+    fn search_layer_filtered(
+        &self,
+        query: &[f32],
+        entry_point: usize,
+        k: usize,
+        ef: usize,
+        metric: Metric,
+        filter: &Filter,
+    ) -> Vec<Candidate> {
+        VISITED_POOL.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            pool.begin(self.nodes.len());
+
+            let ep_vec = self
+                .store
+                .get_vector_unchecked(self.nodes[entry_point].slot);
+            let ep_dist = compute_distance(query, ep_vec, metric);
+
+            pool.visit(entry_point);
+
+            // Min-heap: closest unexpanded nodes (matching or not).
+            let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+            frontier.push(Reverse(Candidate {
+                node_idx: entry_point,
+                distance: ep_dist,
+            }));
+
+            // Max-heap: the k closest matching nodes so far (worst on top).
+            let mut matches: BinaryHeap<Candidate> = BinaryHeap::new();
+            if !self.nodes[entry_point].deleted
+                && self
+                    .store
+                    .metadata(self.nodes[entry_point].slot)
+                    .is_some_and(|metadata| filter.matches(metadata))
+            {
+                matches.push(Candidate {
+                    node_idx: entry_point,
+                    distance: ep_dist,
+                });
+            }
+
+            let mut expanded = 0usize;
+
+            while let Some(Reverse(current)) = frontier.pop() {
+                let worst_match = matches.peek().map(|c| c.distance).unwrap_or(f32::MAX);
+                if expanded >= ef && matches.len() >= k && current.distance > worst_match {
+                    break;
+                }
+                expanded += 1;
+
+                let neighbors = self.neighbors(current.node_idx, 0);
+
+                for (i, &neighbor_link) in neighbors.iter().enumerate() {
+                    let neighbor_idx = neighbor_link as usize;
+
+                    // Prefetch the next neighbor's vector while we process this one.
+                    if let Some(&next_link) = neighbors.get(i + 1) {
+                        self.store
+                            .prefetch_vector(self.nodes[next_link as usize].slot);
+                    }
+
+                    if !pool.visit(neighbor_idx) {
+                        continue;
+                    }
+
+                    let n_vec = self
+                        .store
+                        .get_vector_unchecked(self.nodes[neighbor_idx].slot);
+                    let dist = compute_distance(query, n_vec, metric);
+
+                    let worst_match = matches.peek().map(|c| c.distance).unwrap_or(f32::MAX);
+
+                    // A neighbor joins the frontier as a waypoint unless it is
+                    // provably useless: once the budget is spent and k matches
+                    // are in hand, a node farther than the farthest match can
+                    // never be expanded (termination fires the moment it would
+                    // surface, and worst_match only shrinks), so skipping the
+                    // push only saves heap work without changing the search.
+                    if matches.len() < k || expanded < ef || dist <= worst_match {
+                        frontier.push(Reverse(Candidate {
+                            node_idx: neighbor_idx,
+                            distance: dist,
+                        }));
+                    }
+
+                    // Matching, live nodes compete for the k match slots — but
+                    // only while they can still improve the match set.
+                    if !self.nodes[neighbor_idx].deleted
+                        && (matches.len() < k || dist < worst_match)
+                        && self
+                            .store
+                            .metadata(self.nodes[neighbor_idx].slot)
+                            .is_some_and(|metadata| filter.matches(metadata))
+                    {
+                        matches.push(Candidate {
+                            node_idx: neighbor_idx,
+                            distance: dist,
+                        });
+                        if matches.len() > k {
+                            matches.pop(); // evict worst
+                        }
+                    }
+                }
+            }
+
+            // Convert to sorted vec (closest first)
+            let mut sorted: Vec<Candidate> = matches.into_vec();
+            sorted.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+            sorted
+        })
     }
 
     /// Search layer for insertion — same beam search used during construction.
@@ -2003,6 +2134,56 @@ mod tests {
     }
 
     #[test]
+    fn test_search_filtered_returns_matching_entry_point() {
+        // A single-node index: the entry point itself is the only candidate,
+        // so the traversal must check it against the filter directly.
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        let id = index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, id);
+
+        // A deleted entry point must not be returned even though it matches.
+        // Raise the compaction threshold so the tombstone stays in the graph.
+        index.config.max_tombstone_ratio = 1.0;
+        index.delete(id).unwrap();
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_filtered_traverses_non_matching_waypoints() {
+        // Matches sit far from a dense non-matching cluster around the origin.
+        // The traversal must use non-matching nodes as waypoints to reach them
+        // instead of stopping when the local (non-matching) neighborhood is
+        // exhausted.
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        for i in 0..200 {
+            let x = (i as f32) * 0.01;
+            index.insert(&[x, 0.0]).unwrap();
+        }
+        for i in 0..3 {
+            index
+                .insert_with_metadata(&[100.0 + i as f32, 0.0], int_metadata("cat", 1))
+                .unwrap();
+        }
+
+        let results = index
+            .search_filtered(&[100.4, 0.0], 3, 16, &eq("cat", 1i64))
+            .unwrap();
+        // ids are 1-based in insert order: the three matches are 201, 202, 203.
+        let ids: Vec<u64> = results.iter().map(|r| r.vector_id).collect();
+        assert_eq!(ids, vec![201, 202, 203]);
+    }
+
+    #[test]
     fn test_insert_with_metadata_dimension_mismatch() {
         let (_dir, mut index) = setup(2, Metric::L2, 8);
         assert!(
@@ -2111,7 +2292,7 @@ mod tests {
     #[test]
     fn test_filtered_recall_across_selectivities() {
         // Filtered recall@10 must stay high against brute-force filtered ground
-        // truth at 1%, 10%, and 50% selectivity. The adaptive over-fetch in
+        // truth at 1%, 10%, and 50% selectivity. The filter-aware traversal in
         // search_filtered is what makes this hold as selectivity shrinks.
         use rand::Rng;
         let mut rng = rand::rng();
