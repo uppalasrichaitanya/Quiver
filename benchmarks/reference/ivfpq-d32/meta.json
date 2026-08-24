@@ -1,0 +1,38 @@
+{
+  "n": 4096,
+  "dimension": 32,
+  "n_queries": 100,
+  "k": 10,
+  "nlist": 32,
+  "m": 8,
+  "ksub": 256,
+  "iters": 10,
+  "seed": 20260824,
+  "rerank_factor": 4,
+  "expected": {
+    "1": {
+      "recall": 0.363,
+      "recall_rerank": 0.673
+    },
+    "2": {
+      "recall": 0.46,
+      "recall_rerank": 0.873
+    },
+    "4": {
+      "recall": 0.46,
+      "recall_rerank": 0.875
+    },
+    "8": {
+      "recall": 0.46,
+      "recall_rerank": 0.875
+    },
+    "16": {
+      "recall": 0.46,
+      "recall_rerank": 0.875
+    },
+    "32": {
+      "recall": 0.46,
+      "recall_rerank": 0.875
+    }
+  }
+}

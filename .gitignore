@@ -33,6 +33,8 @@ dist/
 *.ivecs
 *.bvecs
 sift1m/
+# ...except the small committed IVF-PQ cross-validation fixtures
+!benchmarks/reference/**/*.fvecs
 
 # Logs
 *.log
