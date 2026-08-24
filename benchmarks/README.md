@@ -149,18 +149,34 @@ memory are no longer it.
 
 ## Filtered search (metadata + `search_filtered`)
 
-Measured 2026-08-23 on the same host, single-threaded, SIFT1M (1M base,
-10k queries, L2, k=10), M=32 / efConstruction=200. Raw JSON:
-[`results/2026-08-23-i7-12650h/raw/quiver-filtered-m32-efc200.json`](results/2026-08-23-i7-12650h/raw/quiver-filtered-m32-efc200.json).
+Measured on the same host, single-threaded, SIFT1M (1M base, 10k queries,
+L2, k=10), M=32 / efConstruction=200. Two measurements:
+
+- **2026-08-23 — naive post-filtering baseline.** Raw JSON:
+  [`results/2026-08-23-i7-12650h/raw/quiver-filtered-m32-efc200.json`](results/2026-08-23-i7-12650h/raw/quiver-filtered-m32-efc200.json).
+- **2026-08-23b — filter-aware traversal** (the current implementation). Raw
+  JSON:
+  [`results/2026-08-23b-i7-12650h/raw/quiver-filtered-m32-efc200.json`](results/2026-08-23b-i7-12650h/raw/quiver-filtered-m32-efc200.json).
+  This is the cool-down rerun of the code; see the variance note below.
 
 Every base vector carries deterministic category metadata
 (`cat100 = position % 100`, `cat10 = position % 10`, `parity = position % 2`).
 Each selectivity scenario is an `Eq` filter on one of those keys, matching
 ~1% (10,000 vectors), ~10% (100,000), or ~50% (500,000) of the corpus. Ground
 truth is brute-force scan restricted to the matching vectors — the shipped SIFT
-ground-truth file is unfiltered and unusable here. `search_filtered` is naive
-post-filtering with adaptive over-fetch: the beam starts at `max(ef_search, k)`
-and expands until `k` matches are collected or the graph is exhausted.
+ground-truth file is unfiltered and unusable here.
+
+The baseline `search_filtered` was naive post-filtering with adaptive
+over-fetch: the beam started at `max(ef_search, k)` and the whole search
+restarted at 4x beam width until `k` matches were collected or the graph was
+exhausted. The 2026-08-23b implementation is a filter-aware single-pass
+traversal: the layer-0 beam search explores matching and non-matching nodes
+alike as waypoints, keeps the `k` closest matching nodes in a separate heap,
+expands at least `max(ef_search, k)` nodes, and stops once the closest
+unexpanded node is farther than the farthest kept match. Neighbors that can no
+longer affect the outcome are never pushed onto the frontier.
+
+### Naive post-filtering (2026-08-23)
 
 | Selectivity | ef_search | Recall@10 | QPS | p50 ms | p99 ms |
 |---:|---:|---:|---:|---:|---:|
@@ -174,17 +190,50 @@ and expands until `k` matches are collected or the graph is exhausted.
 | 50% | 200 | 0.9982 | 1045.7 | 0.869 | 3.086 |
 | 50% | 400 | 0.9991 | 688.6 | 1.464 | 2.420 |
 
-Recall stays **>= 0.992 at every selectivity and ef_search**, and is 0.9995 at
-1% because the adaptive over-fetch expands the beam until all `k` matches are
-found. The cost of naive post-filtering shows up in throughput, not recall:
-search latency grows roughly with the inverse of selectivity. At ef=100 the 50%
-case runs 2156 QPS (p50 0.46 ms) — close to the unfiltered headline (2680 QPS /
-0.38 ms) — while the 1% case drops to ~84 QPS (p50 ~9.9 ms). A filter-aware
-graph traversal is the documented next step to close the low-selectivity gap.
+### Filter-aware traversal (2026-08-23b)
 
-Build for this run was 1457.5 s (vs 1144.9 s for the same config without
-metadata), the extra time going to serializing and fsyncing the per-vector
-metadata in the WAL. The metadata snapshot sidecar is 73.0 MB for 1M vectors
+| Selectivity | ef_search | Recall@10 | QPS | p50 ms | p99 ms |
+|---:|---:|---:|---:|---:|---:|
+| 1% | 100 | 0.9983 | 195.2 | 4.511 | 12.74 |
+| 1% | 200 | 0.9983 | 222.6 | 3.867 | 12.46 |
+| 1% | 400 | 0.9983 | 322.2 | 3.023 | 5.92 |
+| 10% | 100 | 0.9837 | 2001.7 | 0.498 | 0.891 |
+| 10% | 200 | 0.9948 | 1279.0 | 0.804 | 1.184 |
+| 10% | 400 | 0.9991 | 700.5 | 1.459 | 2.291 |
+| 50% | 100 | 0.9940 | 2124.4 | 0.480 | 0.785 |
+| 50% | 200 | 0.9981 | 1236.6 | 0.829 | 1.306 |
+| 50% | 400 | 0.9990 | 706.1 | 1.451 | 2.264 |
+
+The filter-aware traversal closes most of the low-selectivity gap without
+regressing the high-selectivity cases:
+
+- **1% selectivity:** 2.3x QPS at ef=100 (83.7 -> 195.2) and 2.4x at ef=400
+  (135.4 -> 322.2); p99 latency at ef=100 fell 4.1x (52.3 -> 12.7 ms). The
+  restart loop is gone, so all ef_search levels now cost about the same.
+- **10% selectivity:** 2.0x QPS at ef=100 (978.5 -> 2001.7); ef=200/400 are
+  on par.
+- **50% selectivity:** on par or better at every ef_search (ef=200: 1045.7 ->
+  1236.6).
+
+Recall stays **>= 0.9837 at every selectivity and ef_search**, at a small
+cost versus the baseline at ef=100 (1%: 0.9995 -> 0.9983; 10%: 0.9925 ->
+0.9837). The baseline's higher ef=100 recall came from over-fetching until
+near-exhaustion at low selectivity — exactly the cost this change removes.
+`ef_search` remains the quality knob: at ef=400 the traversal matches the
+baseline recall (0.9991 at 10% and 50%) while still 2.4x faster at 1%.
+
+**Variance note.** The 1% row is sensitive to the host's thermal state right
+after the brute-force ground-truth pass: across three runs of the same
+traversal, ef=100 measured 67.6 / 195.2 / 281.5 QPS, and the cleanest run was
+flat across ef_search (~280 QPS, p50 ~3.4 ms — 3.4x the baseline). The
+baseline's own 1% row shows the same first-scenario contamination (ef=200
+measured slower than ef=100, which a clean run cannot produce). The table
+above is the cool-down rerun — the conservative measurement.
+
+Build for the 2026-08-23 run was 1457.5 s (vs 1144.9 s for the same config
+without metadata), the extra time going to serializing and fsyncing the
+per-vector metadata in the WAL; the 2026-08-23b rerun built in 1110.0 s on a
+settled host. The metadata snapshot sidecar is 73.0 MB for 1M vectors
 (~73 bytes/vector). Peak RSS was 2013 MB, higher than the unfiltered run's
 902 MB because the benchmark also keeps a contiguous 512 MB copy of the base
 vectors resident for the brute-force ground-truth pass.
