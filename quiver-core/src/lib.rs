@@ -18,6 +18,7 @@
 pub mod distance;
 pub mod error;
 pub mod index;
+pub mod kmeans;
 pub mod metadata;
 pub mod quantization;
 pub mod storage;

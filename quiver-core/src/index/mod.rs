@@ -9,9 +9,12 @@
 //!   navigable small world graph. The primary ANN structure.
 //! - [`Sq8Index`](sq8::Sq8Index) provides batch-built flat search over vectors
 //!   compressed to one byte per dimension.
+//! - [`IvfPqIndex`](ivfpq::IvfPqIndex) — batch-built inverted-file index with
+//!   product-quantized vectors, the memory-efficient alternative to HNSW.
 
 pub mod brute_force;
 pub mod hnsw;
+pub mod ivfpq;
 pub mod sq8;
 
 /// A single search result: the vector's internal ID and its distance from the query.
