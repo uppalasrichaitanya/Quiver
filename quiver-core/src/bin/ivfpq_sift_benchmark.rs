@@ -14,8 +14,8 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use quiver_core::index::ivfpq::{IvfPqConfig, IvfPqIndex};
 use quiver_core::index::SearchResult;
+use quiver_core::index::ivfpq::{IvfPqConfig, IvfPqIndex};
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -88,10 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dimension = queries[0].len();
     let baseline_rss_bytes = current_rss_bytes();
 
-    println!(
-        "loading {} SIFT base vectors for IVF-PQ",
-        args.base_limit
-    );
+    println!("loading {} SIFT base vectors for IVF-PQ", args.base_limit);
     let vectors = read_fvecs_with_progress(&args.base, args.base_limit)?;
 
     let config = IvfPqConfig {
