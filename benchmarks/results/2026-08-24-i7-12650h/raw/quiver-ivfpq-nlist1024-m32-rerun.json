@@ -1,0 +1,165 @@
+{
+  "engine": "quiver-ivfpq",
+  "engine_version": "0.1.0",
+  "dataset": "SIFT1M",
+  "dimension": 128,
+  "base_vectors": 1000000,
+  "queries": 10000,
+  "thread_count": 1,
+  "random_seed": 42,
+  "nlist": 1024,
+  "m": 32,
+  "ksub": 256,
+  "kmeans_iters": 10,
+  "training_size": 131072,
+  "store_vectors": true,
+  "build_seconds": 94.4561652,
+  "baseline_rss_bytes": 14848000,
+  "rss_after_build_bytes": 564961280,
+  "index_rss_delta_bytes": 550113280,
+  "peak_rss_bytes": 1294704640,
+  "code_bytes": 32000000,
+  "vector_bytes": 512000000,
+  "search": [
+    {
+      "k": 10,
+      "nprobe": 1,
+      "rerank_factor": 0,
+      "recall": 0.33842999999999407,
+      "qps": 15732.024470849425,
+      "p50_latency_ms": 0.0599,
+      "p99_latency_ms": 0.1153,
+      "total_seconds": 0.6356461
+    },
+    {
+      "k": 10,
+      "nprobe": 1,
+      "rerank_factor": 16,
+      "recall": 0.3708699999999954,
+      "qps": 10399.42744912236,
+      "p50_latency_ms": 0.0912,
+      "p99_latency_ms": 0.1721,
+      "total_seconds": 0.9615914
+    },
+    {
+      "k": 10,
+      "nprobe": 8,
+      "rerank_factor": 0,
+      "recall": 0.6555899999999993,
+      "qps": 6210.842192685665,
+      "p50_latency_ms": 0.1497,
+      "p99_latency_ms": 0.3226,
+      "total_seconds": 1.6100876
+    },
+    {
+      "k": 10,
+      "nprobe": 8,
+      "rerank_factor": 16,
+      "recall": 0.8346599999999844,
+      "qps": 4780.838704446257,
+      "p50_latency_ms": 0.1979,
+      "p99_latency_ms": 0.3792,
+      "total_seconds": 2.0916832
+    },
+    {
+      "k": 10,
+      "nprobe": 16,
+      "rerank_factor": 0,
+      "recall": 0.6970599999999979,
+      "qps": 3726.955211017595,
+      "p50_latency_ms": 0.2534,
+      "p99_latency_ms": 0.5015,
+      "total_seconds": 2.6831554
+    },
+    {
+      "k": 10,
+      "nprobe": 16,
+      "rerank_factor": 16,
+      "recall": 0.9276199999999742,
+      "qps": 3154.818655818213,
+      "p50_latency_ms": 0.3021,
+      "p99_latency_ms": 0.5711,
+      "total_seconds": 3.1697543
+    },
+    {
+      "k": 10,
+      "nprobe": 32,
+      "rerank_factor": 0,
+      "recall": 0.7142899999999972,
+      "qps": 2112.8216773644813,
+      "p50_latency_ms": 0.4564,
+      "p99_latency_ms": 0.837,
+      "total_seconds": 4.7330071
+    },
+    {
+      "k": 10,
+      "nprobe": 32,
+      "rerank_factor": 16,
+      "recall": 0.9773499999999811,
+      "qps": 1887.2506274306254,
+      "p50_latency_ms": 0.5111,
+      "p99_latency_ms": 0.9315,
+      "total_seconds": 5.2987133
+    },
+    {
+      "k": 10,
+      "nprobe": 64,
+      "rerank_factor": 0,
+      "recall": 0.7198599999999987,
+      "qps": 1140.5838094196688,
+      "p50_latency_ms": 0.8612,
+      "p99_latency_ms": 1.4518,
+      "total_seconds": 8.7674399
+    },
+    {
+      "k": 10,
+      "nprobe": 64,
+      "rerank_factor": 16,
+      "recall": 0.9951999999999936,
+      "qps": 1057.8887739128354,
+      "p50_latency_ms": 0.9283,
+      "p99_latency_ms": 1.5468,
+      "total_seconds": 9.4527896
+    },
+    {
+      "k": 10,
+      "nprobe": 128,
+      "rerank_factor": 0,
+      "recall": 0.7209699999999982,
+      "qps": 594.0498999658581,
+      "p50_latency_ms": 1.6515,
+      "p99_latency_ms": 2.7405,
+      "total_seconds": 16.8336027
+    },
+    {
+      "k": 10,
+      "nprobe": 128,
+      "rerank_factor": 16,
+      "recall": 0.999049999999998,
+      "qps": 571.1939119136964,
+      "p50_latency_ms": 1.7137,
+      "p99_latency_ms": 2.9223,
+      "total_seconds": 17.5071894
+    },
+    {
+      "k": 10,
+      "nprobe": 256,
+      "rerank_factor": 0,
+      "recall": 0.7209199999999983,
+      "qps": 306.64255887843007,
+      "p50_latency_ms": 3.1895,
+      "p99_latency_ms": 5.0794,
+      "total_seconds": 32.6112593
+    },
+    {
+      "k": 10,
+      "nprobe": 256,
+      "rerank_factor": 16,
+      "recall": 0.9992899999999985,
+      "qps": 303.6926742381522,
+      "p50_latency_ms": 3.2307,
+      "p99_latency_ms": 4.8579,
+      "total_seconds": 32.9280251
+    }
+  ]
+}

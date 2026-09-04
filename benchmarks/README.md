@@ -6,6 +6,8 @@ FAISS `IndexHNSWFlat`, and hnswlib. Raw JSON under
 source of truth for the July HNSW runs and for the FAISS/hnswlib reference
 numbers. SQ8 and brute-force memory results are under
 [`results/2026-07-29-i7-12650h/raw`](results/2026-07-29-i7-12650h/raw).
+IVF-PQ results are under
+[`results/2026-08-24-i7-12650h/raw`](results/2026-08-24-i7-12650h/raw).
 
 A same-host Quiver rerun on **2026-08-22** — after the diversified
 neighbor-selection and packed `u32` adjacency commits — lives under
@@ -146,6 +148,73 @@ At the headline config the rerun raises Recall@10 above both competitors
 (0.9961 vs 0.9922 / 0.9920) but throughput drops to 727.8 QPS, ~3x behind
 FAISS and hnswlib. Search speed is now the primary remaining gap; recall and
 memory are no longer it.
+
+## IVF-PQ recall and throughput
+
+Measured on the same host (single-threaded, SIFT1M, 1M base, 10k queries,
+L2, k=10) on 2026-08-24. Index configuration: nlist=1024 coarse centroids,
+m=32 subspaces, ksub=256 centroids per subspace (a 32-byte PQ code per
+vector), k-means trained for 10 iterations on a 131072-vector random subset.
+The configuration was selected by `ivfpq_tune.py`, which sweeps the numpy
+reference (`pq_reference.py`) on a 100k SIFT subset. The Rust index is
+cross-validated against that reference in `tests/ivfpq_reference.rs`: on the
+committed trained state under `reference/ivfpq-d32`, it reproduces the
+reference's plain and reranked recall at nprobe 1..32 within 0.01.
+
+Each nprobe row is reported twice: plain ADC ranking over the compressed
+codes (`rerank_factor=0`) and exact-L2 rerank of the top
+`nprobe x rerank_factor` candidates against the stored full-precision
+vectors (`rerank_factor=16`). Values are measured over all 10,000 queries.
+
+| nprobe | rerank | Recall@10 | QPS | p50 ms | p99 ms |
+|---:|---|---:|---:|---:|---:|
+| 1 | off | 0.3384 | 15732.0 | 0.060 | 0.115 |
+| 1 | x16 | 0.3709 | 10399.4 | 0.091 | 0.172 |
+| 8 | off | 0.6556 | 6210.8 | 0.150 | 0.323 |
+| 8 | x16 | 0.8347 | 4780.8 | 0.198 | 0.379 |
+| 16 | off | 0.6971 | 3727.0 | 0.253 | 0.501 |
+| 16 | x16 | 0.9276 | 3154.8 | 0.302 | 0.571 |
+| 32 | off | 0.7143 | 2112.8 | 0.456 | 0.837 |
+| 32 | x16 | 0.9773 | 1887.3 | 0.511 | 0.931 |
+| 64 | off | 0.7199 | 1140.6 | 0.861 | 1.452 |
+| 64 | x16 | 0.9952 | 1057.9 | 0.928 | 1.547 |
+| 128 | off | 0.7210 | 594.0 | 1.651 | 2.740 |
+| 128 | x16 | 0.9990 | 571.2 | 1.714 | 2.922 |
+| 256 | off | 0.7209 | 306.6 | 3.189 | 5.079 |
+| 256 | x16 | 0.9993 | 303.7 | 3.231 | 4.858 |
+
+Build time was 94.5 s versus 1144.9 s for HNSW M=32/efC=200 (~12x faster):
+k-means and codebook training are single passes, and the index is built in
+memory with no WAL fsync per insert. Raw JSON:
+[`results/2026-08-24-i7-12650h/raw/quiver-ivfpq-nlist1024-m32-rerun.json`](results/2026-08-24-i7-12650h/raw/quiver-ivfpq-nlist1024-m32-rerun.json)
+(the cool-down rerun, used for the table above) and
+[`quiver-ivfpq-nlist1024-m32.json`](results/2026-08-24-i7-12650h/raw/quiver-ivfpq-nlist1024-m32.json)
+(first run; recall is bit-identical, QPS within ~2%).
+
+Plain ADC tops out near 0.72 recall@10 regardless of how many lists are
+probed — that is the error floor of the 32-byte code, not of the search.
+Exact-L2 rerank is the quality lever: it reaches 0.9952 at 1057.9 QPS
+(nprobe=64) and 0.9990 at 571.2 QPS (nprobe=128).
+
+### IVF-PQ vs HNSW vs SQ8 at comparable recall
+
+Single-threaded, same dataset, recall@10 in the 0.99–0.996 band:
+
+| Index | Parameters | Recall@10 | QPS | Build s | Index payload |
+|---|---|---:|---:|---:|---|
+| Quiver IVF-PQ + rerank | nlist=1024, m=32, ksub=256, nprobe=64 | 0.9952 | 1057.9 | 94.5 | 30.5 MB codes (+ 488.3 MB full vectors for rerank) |
+| Quiver HNSW (2026-08-22 opt) | M=32, efC=200, ef=100 | 0.9961 | 2680.0 | 1144.9 | 488.3 MB vectors + graph |
+| Quiver SQ8 flat | exhaustive scan | 0.9889 | 14.6 | — | 122.1 MB codes |
+
+HNSW wins on throughput and latency at comparable recall; IVF-PQ wins on
+build time and, when the quantized distance alone is acceptable, on payload
+(30.5 MB of codes with no full-precision copy). The rerank path must store
+the full-precision vectors, so IVF-PQ's memory advantage is conditional on
+tolerating ADC-only ranking or paying the 488.3 MB vector cost. IVF-PQ's
+peak RSS of 1234.7 MB includes the contiguous 488.3 MB base copy the
+benchmark keeps resident for ground-truth verification (the same convention
+as the filtered-search note below); the index's own RSS delta after build
+was 524.6 MB (codes + full vectors + centroids/codebooks).
 
 ## Filtered search (metadata + `search_filtered`)
 
@@ -404,3 +473,19 @@ cargo run --release -p quiver-core --bin sift_filtered_benchmark -- \
 The filtered benchmark computes its own brute-force *filtered* ground truth
 (the shipped SIFT ground-truth file is unfiltered), so it takes no
 `--groundtruth` flag.
+
+To rerun the IVF-PQ benchmark (in-memory build, `nprobe` sweep, described in
+its own section above; arguments are positional):
+
+```bash
+cargo run --release -p quiver-core --bin ivfpq_sift_benchmark -- \
+  --base sift_base.fvecs --queries sift_query.fvecs \
+  --groundtruth sift_groundtruth.ivecs \
+  --output results/<date>-<host>/raw/quiver-ivfpq-nlist1024-m32.json \
+  --nlist 1024 --m 32 --ksub 256 --kmeans-iters 10 --training-size 131072 \
+  --rerank-factor 16 --base-limit 1000000 --query-limit 10000
+```
+
+`--rerank-factor 0` skips the exact-L2 rerank rows. Use `ivfpq_tune.py` to
+re-select `nlist`/`m`/`ksub`/iterations against the numpy reference before a
+full-size run.

@@ -17,6 +17,7 @@ Implemented in `quiver-core`:
 - Scalar and hand-written x86_64 AVX2/FMA kernels for L2, dot product, and cosine distance, with runtime dispatch and scalar fallback.
 - Exact brute-force search and multi-layer HNSW insert/search/delete.
 - Batch-built SQ8 flat search with per-dimension calibration, asymmetric distance evaluation, and one-byte vector components.
+- IVF-PQ index: k-means++ coarse clustering, a product quantizer with per-subspace codebooks and an ADC distance table, inverted-file search with a tunable `nprobe`, and optional exact-L2 rerank of compressed candidates. L2-only, and cross-validated in `tests/ivfpq_reference.rs` against a committed numpy reference of the same pipeline.
 - Per-vector key-value metadata and filtered search: a `Metadata` model (`bool`/`int`/`float`/`str`), an `Eq`/`And` `Filter` predicate, durable metadata (WAL op + CRC32 snapshot sidecar, format version 3), and a filter-aware `search_filtered` that traverses the HNSW graph with the filter live during the beam search, using non-matching nodes as waypoints.
 - Tests comparing HNSW recall with brute-force ground truth and real subprocess-kill tests for ordinary WAL recovery and compaction recovery.
 
@@ -27,7 +28,7 @@ The workspace includes an Axum server with insert, search, batch-search, and del
 - HNSW graph topology is persisted as a snapshot on `flush`/`compact` and loaded on `open`, but vectors inserted after the last snapshot still require a rebuild on reopen; a hard kill leaves the snapshot stale (the server flushes on graceful shutdown).
 - The HNSW API is single-threaded. Mutation safety comes from Rust's `&mut self`; the server wraps the index in an `RwLock` (parallel reads, exclusive writes).
 - Filtered search is a single-pass filter-aware traversal, but cost still grows as selectivity shrinks: at SIFT1M/M=32/efc200/ef=100 the 50% case runs ~2124 QPS while the 1% case runs ~195 QPS (an ~11x gap, down from ~25x under the earlier naive post-filtering). Recall stays >= 0.9837 at 1%/10%/50% selectivity. Only `Eq` and `And` filters are implemented; `Or`/`In`/range are deferred, and metadata is immutable after insert.
-- SQ8 is currently an in-memory, batch-built index; online recalibration and persistence are not implemented. IVF-PQ remains planned.
+- SQ8 and IVF-PQ are currently in-memory, batch-built indexes; persistence, online inserts/recalibration, and server/Python exposure of IVF-PQ are not implemented. IVF-PQ is L2-only and has no metadata/filtered search.
 - Benchmark evidence, including reproducible SIFT1M comparisons and scalar/SIMD Criterion results, is documented in `benchmarks/`. A sampling flamegraph remains unavailable after the documented `samply` install attempt.
 - The crates have not yet been released to crates.io or PyPI.
 
@@ -98,7 +99,7 @@ and `POST /shutdown`. A local native Python API is also available through
 ## Workspace layout
 
 ```text
-quiver-core/    mmap storage, WAL, distance kernels, brute-force, HNSW
+quiver-core/    mmap storage, WAL, distance kernels, brute-force, HNSW, SQ8, IVF-PQ
 quiver-server/  Axum HTTP insert/search/delete API
 quiver-py/      PyO3 local Index API
 fuzz/           dedicated file-format libFuzzer package and seed corpus
