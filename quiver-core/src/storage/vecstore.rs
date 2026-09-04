@@ -32,7 +32,7 @@ use crate::error::{QuiverError, Result};
 use crate::metadata::Metadata;
 use crate::storage::format::{VECTOR_ID_SIZE, parse_file_bytes};
 use crate::storage::header::{FORMAT_VERSION, FileHeader, HEADER_SIZE, LEGACY_FORMAT_VERSION};
-use crate::storage::wal::{Wal, WalOp};
+use crate::storage::wal::{Wal, WalEntry, WalOp};
 
 const COMPACTION_PREPARED: &[u8] = b"prepared";
 const COMPACTION_OLD_MOVED: &[u8] = b"old_moved";
@@ -200,6 +200,11 @@ impl VectorStore {
         // entries remain in the WAL as the durable tombstone source until
         // compaction can checkpoint them into a rewritten store.
         let (entries, valid_up_to) = Wal::read_entries(&wal_path_buf)?;
+        // Always truncate the corrupt/torn tail — even when no entry parsed at
+        // all. A torn *first* record would otherwise stay behind, and the next
+        // recovery would treat it plus the following valid records as one
+        // checksum-invalid frame, silently dropping them.
+        Wal::truncate(&wal_path_buf, valid_up_to)?;
         if !entries.is_empty() {
             tracing::info!(count = entries.len(), "Replaying WAL entries");
             let mut recovered = false;
@@ -235,8 +240,6 @@ impl VectorStore {
                     }
                 }
             }
-            // Truncate any corrupt tail
-            Wal::truncate(&wal_path_buf, valid_up_to)?;
             if recovered {
                 store.flush()?;
             }
@@ -515,6 +518,16 @@ impl VectorStore {
     /// so a snapshot can never reference vectors that are not themselves
     /// durable. Snapshot failure only costs the checkpoint — the WAL still
     /// carries every metadata entry — so it is logged rather than returned.
+    ///
+    /// Finally, when both the data file and (if present) the metadata snapshot
+    /// are durable, the WAL is checkpointed: its plain Insert entries are now
+    /// replay-skipped (their IDs are at or below the persisted
+    /// `max_vector_id`), so only Delete and InsertMeta entries are retained —
+    /// deletes have no other durable home, and InsertMeta keeps the WAL as the
+    /// metadata fallback if the snapshot is later corrupted. Without this, an
+    /// insert-only workload that never crosses the compaction threshold would
+    /// grow the WAL without bound, duplicating every vector already in the
+    /// data file.
     pub fn flush(&mut self) -> Result<()> {
         // Update the header in the mmap
         let header_bytes = self.header.to_bytes();
@@ -525,10 +538,38 @@ impl VectorStore {
             .as_ref()
             .expect("vector store file is open")
             .sync_all()?;
-        if let Err(e) = self.write_meta_snapshot() {
-            tracing::warn!(error = %e, "failed to persist metadata snapshot");
+        let meta_ok = match self.write_meta_snapshot() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to persist metadata snapshot");
+                false
+            }
+        };
+        if meta_ok && let Err(e) = self.checkpoint_wal() {
+            tracing::warn!(error = %e, "failed to checkpoint WAL; full log retained");
         }
         Ok(())
+    }
+
+    /// Rewrite the WAL in place, dropping the entries it is retaining.
+    ///
+    /// Safe to run after [`Self::flush`] has made the data file (and, when any
+    /// vector has metadata, the metadata snapshot) durable: plain Insert
+    /// entries are skipped by replay because their IDs are at or below the
+    /// persisted `max_vector_id`, so they are dropped. Delete entries have no
+    /// other durable home, and InsertMeta entries keep the WAL as the metadata
+    /// fallback if the snapshot is later corrupted — both are retained. The
+    /// truncate-and-rewrite happens on the existing handle; a crash in the
+    /// microsecond window loses at most the retained ops logged since the
+    /// previous checkpoint — never vector data.
+    fn checkpoint_wal(&mut self) -> Result<()> {
+        let (entries, _) = Wal::read_entries(&self.wal_path)?;
+        let keep: Vec<&WalEntry> = entries
+            .iter()
+            .filter(|entry| entry.op != WalOp::Insert)
+            .collect();
+        let wal = self.wal.as_mut().expect("vector store WAL is open");
+        wal.checkpoint(&keep)
     }
 
     /// Return the current WAL size in bytes.
@@ -849,6 +890,15 @@ impl VectorStore {
         data: &[f32],
         metadata: Option<Metadata>,
     ) -> Result<()> {
+        // Normal inserts are pre-validated, but this is also called from WAL
+        // replay on externally produced records — a CRC-valid record with the
+        // wrong component count must be rejected, not panic in the copy below.
+        if data.len() != self.header.dimension as usize {
+            return Err(QuiverError::DimensionMismatch {
+                expected: self.header.dimension,
+                actual: data.len() as u32,
+            });
+        }
         let slot = self.header.vector_count as usize;
         let required_size = HEADER_SIZE + (slot + 1) * self.record_size;
 
@@ -1554,10 +1604,13 @@ mod tests {
         assert_eq!(store.get_vector(1).unwrap(), &[9.0, 10.0]);
         assert_eq!(store.vector_id(1).unwrap(), 2);
 
-        // This kill point intentionally recovers the last complete record;
-        // partial-tail truncation remains covered by the lower-level WAL tests.
+        // This kill point intentionally recovers the last complete record.
+        // The recovered insert is checkpointed away from the WAL by the
+        // post-recovery flush (its vector is now durable in the data file and
+        // its ID at or below the persisted max_vector_id), so the WAL holds no
+        // Insert entries anymore — the data file is the source of truth.
         let (entries, valid_up_to) = Wal::read_entries(&wal_path).unwrap();
-        assert_eq!(entries.last().unwrap().vector_id, 2);
+        assert!(entries.iter().all(|entry| entry.op != WalOp::Insert));
         assert_eq!(valid_up_to, fs::metadata(&wal_path).unwrap().len());
     }
 
@@ -1833,5 +1886,124 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert_eq!(store.metadata(0), None);
         assert_eq!(store.metadata(1), Some(&sample_metadata()));
+    }
+
+    #[test]
+    fn test_open_truncates_torn_first_wal_record() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("torn.qvdb");
+        let wal_path = dir.path().join("torn.wal");
+
+        // Fresh store (empty WAL), then a crash that leaves a torn first WAL
+        // record: length prefix + partial body, no valid frame at all.
+        {
+            let _store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+        }
+        {
+            let mut file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+            file.set_len(0).unwrap();
+            file.write_all(&60u32.to_le_bytes()).unwrap(); // claims 60 body bytes
+            file.write_all(&[0u8; 10]).unwrap(); // only 10 present
+            file.sync_all().unwrap();
+        }
+
+        // Open must recover (an empty store) and truncate the torn prefix —
+        // leaving it behind makes the next append merge into a
+        // checksum-invalid frame that truncation then erases (silent data
+        // loss).
+        {
+            let store = VectorStore::open(&data_path, &wal_path).unwrap();
+            assert_eq!(store.len(), 0);
+            assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
+        }
+
+        // A later insert must survive the next recovery.
+        {
+            let mut store = VectorStore::open(&data_path, &wal_path).unwrap();
+            store.insert(&[3.0, 4.0]).unwrap();
+        }
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get_vector(0).unwrap(), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_flush_checkpoints_wal_to_deletes_only() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("chk.qvdb");
+        let wal_path = dir.path().join("chk.wal");
+
+        let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+        store.insert(&[1.0, 2.0]).unwrap(); // id 1
+        store.insert(&[3.0, 4.0]).unwrap(); // id 2
+        store.delete(1).unwrap();
+        store.flush().unwrap();
+
+        // The WAL retains only the durable tombstone; the vector payloads are
+        // in the data file and replay-skipped. Without the checkpoint an
+        // insert-only workload grows the WAL without bound.
+        let (entries, _) = Wal::read_entries(&wal_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, WalOp::Delete);
+        assert_eq!(entries[0].vector_id, 1);
+
+        // Recovery from the checkpointed state: id 2 lives, id 1 stays gone.
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(store.is_deleted(1));
+        assert!(!store.is_deleted(2));
+    }
+
+    #[test]
+    fn test_flush_clears_wal_when_no_deletes() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("nodel.qvdb");
+        let wal_path = dir.path().join("nodel.wal");
+
+        let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+        store.insert(&[1.0, 2.0]).unwrap();
+        store.insert(&[3.0, 4.0]).unwrap();
+        store.insert(&[5.0, 6.0]).unwrap();
+        store.flush().unwrap();
+
+        let (entries, _) = Wal::read_entries(&wal_path).unwrap();
+        assert!(entries.is_empty());
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn test_wal_replay_rejects_wrong_dimension_record() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("dim.qvdb");
+        let wal_path = dir.path().join("dim.wal");
+
+        // A CRC-valid Insert record carrying 4 floats into a 2-d store must
+        // yield a DimensionMismatch error, not a panic in the mmap copy.
+        let mut body = Vec::new();
+        body.push(WalOp::Insert as u8);
+        body.extend_from_slice(&1u64.to_le_bytes());
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        let frame = Wal::entry_frame(&body).unwrap();
+
+        // Create the store (fresh WAL), then append the bad frame.
+        let store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+        drop(store);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        file.write_all(&frame).unwrap();
+        file.sync_all().unwrap();
+
+        match VectorStore::open(&data_path, &wal_path) {
+            Err(QuiverError::DimensionMismatch { .. }) => {}
+            Err(error) => panic!("expected DimensionMismatch, got {error:?}"),
+            Ok(_) => panic!("wrong-dimension WAL record unexpectedly replayed"),
+        }
     }
 }

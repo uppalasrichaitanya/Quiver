@@ -29,10 +29,12 @@ pub fn kmeans<R: Rng>(
     if n == 0 || d == 0 {
         return Err(QuiverError::EmptyIndex);
     }
-    if data.len() != n * d {
+    if let Some(expected) = n.checked_mul(d)
+        && expected != data.len()
+    {
         return Err(QuiverError::DimensionMismatch {
-            expected: (n * d) as u32,
-            actual: data.len() as u32,
+            expected: expected.min(u32::MAX as usize) as u32,
+            actual: data.len().min(u32::MAX as usize) as u32,
         });
     }
     if k == 0 {
@@ -109,11 +111,30 @@ pub fn kmeans<R: Rng>(
 }
 
 /// D^2-weighted sampling: pick an index with probability proportional to
-/// `closest[i]`. Falls back to uniform sampling when all distances are zero.
+/// `closest[i]`. Falls back to uniform sampling when all distances are zero,
+/// and to the farthest point when squared distances overflow to infinity
+/// (finite-but-huge inputs) where a proportional draw is ill-defined.
 fn sample_d2<R: Rng>(closest: &[f32], n: usize, rng: &mut R) -> usize {
     let total: f64 = closest.iter().take(n).map(|&value| value as f64).sum();
     if total <= 0.0 {
         return rng.random_range(0..n);
+    }
+    if !total.is_finite() {
+        // At least one distance overflowed to +inf; it carries all the
+        // sampling mass. Pick the first such index (lowest-index tie-break,
+        // matching the rest of the implementation).
+        return closest
+            .iter()
+            .position(|&value| value.is_infinite())
+            .unwrap_or_else(|| {
+                closest
+                    .iter()
+                    .take(n)
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
     }
     let threshold = rng.random_range(0.0..total);
     let mut acc = 0.0f64;
@@ -246,5 +267,16 @@ mod tests {
         assert!(kmeans(&[0.0, f32::NAN], 1, 2, 1, 4, &mut rng).is_err());
         // data length inconsistent with n*d
         assert!(kmeans(&[0.0, 1.0, 2.0], 2, 2, 1, 4, &mut rng).is_err());
+    }
+
+    #[test]
+    fn huge_finite_values_do_not_panic_d2_sampling() {
+        // Components near f32 max make squared distances overflow to +inf;
+        // D^2 sampling must not feed a non-finite range to the RNG.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let data = [1e30f32, -1e30, 0.0, 0.0];
+        let (centroids, labels) = kmeans(&data, 2, 2, 2, 3, &mut rng).unwrap();
+        assert_eq!(centroids.len(), 4);
+        assert!(labels.iter().all(|&l| l < 2));
     }
 }

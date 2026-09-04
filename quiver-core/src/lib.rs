@@ -11,7 +11,9 @@
 //!
 //! - [`storage`] — Custom memory-mapped file format with versioned header and WAL
 //! - [`distance`] — Distance metrics (L2, cosine, dot product) with scalar and SIMD implementations
-//! - [`index`] — Index implementations (brute-force and HNSW)
+//! - [`kmeans`] — k-means++ clustering used to train coarse and product-quantizer codebooks
+//! - [`quantization`] — SQ8 scalar quantizer and the product quantizer (codebooks + ADC)
+//! - [`index`] — Index implementations (brute-force, HNSW, SQ8 flat, IVF-PQ)
 //! - [`metadata`] — Key-value vector metadata and filter predicates
 //! - [`error`] — Unified error types
 

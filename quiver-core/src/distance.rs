@@ -69,7 +69,10 @@ pub fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 /// Compute the cosine similarity between two vectors (scalar).
 ///
 /// Returns dot(a, b) / (||a|| * ||b||). If either vector has zero magnitude,
-/// returns 0.0.
+/// returns 0.0. If the components are finite but so large that the
+/// intermediate squares overflow f32, the vectors are rescaled to unit
+/// max-abs and the similarity recomputed (cosine is scale-invariant), so the
+/// result is still finite.
 #[inline]
 pub fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
@@ -84,11 +87,43 @@ pub fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
         norm_b += y * y;
     }
 
+    finish_cosine(dot, norm_a, norm_b, a, b)
+}
+
+/// Final step of a cosine similarity: divide the dot product by the product
+/// of the magnitudes, with a rescaling fallback for finite inputs whose
+/// squared components overflowed to infinity (`inf / inf` would be NaN).
+fn finish_cosine(dot: f32, norm_a: f32, norm_b: f32, a: &[f32], b: &[f32]) -> f32 {
+    let magnitude = (norm_a * norm_b).sqrt();
+    if magnitude == 0.0 {
+        return 0.0;
+    }
+    let similarity = dot / magnitude;
+    if similarity.is_finite() {
+        return similarity;
+    }
+    let max_a = a.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
+    let max_b = b.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
+    if max_a == 0.0 || max_b == 0.0 || !max_a.is_finite() || !max_b.is_finite() {
+        return 0.0;
+    }
+    let scale_a = 1.0 / max_a;
+    let scale_b = 1.0 / max_b;
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xs = x * scale_a;
+        let ys = y * scale_b;
+        dot += xs * ys;
+        norm_a += xs * xs;
+        norm_b += ys * ys;
+    }
     let magnitude = (norm_a * norm_b).sqrt();
     if magnitude == 0.0 {
         0.0
     } else {
-        dot / magnitude
+        (dot / magnitude).clamp(-1.0, 1.0)
     }
 }
 
@@ -306,12 +341,7 @@ mod avx2 {
             norm_b += y * y;
         }
 
-        let magnitude = (norm_a * norm_b).sqrt();
-        if magnitude == 0.0 {
-            0.0
-        } else {
-            dot / magnitude
-        }
+        super::finish_cosine(dot, norm_a, norm_b, a, b)
     }
 
     /// Horizontal sum of all 8 floats in an __m256.
@@ -509,6 +539,36 @@ mod tests {
         let a = vec![0.0, 0.0];
         let b = vec![1.0, 2.0];
         assert!(approx_eq(cosine_similarity(&a, &b), 0.0));
+    }
+
+    #[test]
+    fn test_cosine_huge_finite_values_are_finite() {
+        // Components near f32 max make x*x overflow to inf; the naive
+        // inf/inf division would yield NaN. The rescaling fallback must
+        // still return a correct, finite similarity.
+        let a = vec![1e20f32, 0.0, 0.0];
+        let b = vec![1e20f32, 0.0, 0.0];
+        let same = cosine_similarity(&a, &b);
+        assert!(
+            same.is_finite(),
+            "same-direction similarity not finite: {same}"
+        );
+        assert!(approx_eq(same, 1.0));
+
+        let c = vec![0.0f32, 1e20, 0.0];
+        let ortho = cosine_similarity(&a, &c);
+        assert!(
+            ortho.is_finite(),
+            "orthogonal similarity not finite: {ortho}"
+        );
+        assert!(approx_eq(ortho, 0.0));
+
+        // The dispatched (SIMD) path must behave the same as the scalar path.
+        let d = vec![1e20f32, 0.0, 0.0];
+        let e = vec![0.0f32, 1e20, 0.0];
+        let via_dispatch = cosine_similarity(&d, &e);
+        assert!(via_dispatch.is_finite());
+        assert!(approx_eq(via_dispatch, cosine_similarity_scalar(&d, &e)));
     }
 
     #[test]

@@ -143,15 +143,24 @@ impl ProductQuantizer {
         }
         let dimension = vectors[0].len();
         Self::validate_shape(dimension, m, ksub)?;
+        if ksub > n {
+            return Err(QuiverError::InvalidFormat(format!(
+                "PQ requires at least ksub={ksub} training vectors, got {n}"
+            )));
+        }
         let dsub = dimension / m;
 
-        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
-        if flat.len() != n * dimension {
-            return Err(QuiverError::DimensionMismatch {
-                expected: dimension as u32,
-                actual: (flat.len() / n.max(1)) as u32,
-            });
+        // Every vector must have the full dimension; a total-length check
+        // alone would silently misalign sub-vectors for mixed-length input.
+        for vector in vectors {
+            if vector.len() != dimension {
+                return Err(QuiverError::DimensionMismatch {
+                    expected: dimension as u32,
+                    actual: vector.len() as u32,
+                });
+            }
         }
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
         if !flat.iter().all(|value| value.is_finite()) {
             return Err(QuiverError::InvalidFormat(
                 "PQ training vectors must contain only finite values".to_owned(),
@@ -188,6 +197,11 @@ impl ProductQuantizer {
         if codebooks.len() != m * ksub * dsub {
             return Err(QuiverError::InvalidFormat(
                 "PQ codebook length does not match m * ksub * dsub".to_owned(),
+            ));
+        }
+        if codebooks.iter().any(|value| !value.is_finite()) {
+            return Err(QuiverError::InvalidFormat(
+                "PQ codebooks must contain only finite values".to_owned(),
             ));
         }
         Ok(Self {
@@ -544,5 +558,30 @@ mod tests {
         assert!(pq.encode(&[0.0; 7]).is_err()); // wrong dimension
         assert!(pq.reconstruct(&[0u8; 3]).is_err()); // wrong code count
         assert!(ProductQuantizer::from_codebooks(2, 16, 4, vec![0.0; 5]).is_err());
+    }
+
+    #[test]
+    fn pq_rejects_ksub_larger_than_vector_count() {
+        // k-means clamps k to n, so this used to panic inside the codebook
+        // copy; it must be a clean error instead.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+        let vectors = clustered_vectors(&mut rng, 4, 8);
+        assert!(ProductQuantizer::train(&vectors, 2, 64, 4, &mut rng).is_err());
+    }
+
+    #[test]
+    fn pq_rejects_mixed_length_vectors() {
+        // 8 + 7 + 9 = 24 = 3 * 8, so a total-length check alone would pass
+        // and silently train on shifted sub-vectors.
+        let vectors = vec![vec![0.0f32; 8], vec![1.0f32; 7], vec![2.0f32; 9]];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(13);
+        assert!(ProductQuantizer::train(&vectors, 2, 16, 4, &mut rng).is_err());
+    }
+
+    #[test]
+    fn pq_from_codebooks_rejects_non_finite() {
+        let mut book = vec![0.0f32; 2 * 16 * 4];
+        book[0] = f32::NAN;
+        assert!(ProductQuantizer::from_codebooks(2, 16, 4, book).is_err());
     }
 }

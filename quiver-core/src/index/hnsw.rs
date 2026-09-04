@@ -63,7 +63,12 @@ pub struct HnswConfig {
 
 impl HnswConfig {
     /// Create a config with the given M parameter. Other parameters are derived.
+    ///
+    /// M is clamped to at least 2: the layer-assignment formula `1/ln(M)` and
+    /// the graph topology are only meaningful for M >= 2 (M = 1 would divide by
+    /// zero and assign every node to an unbounded layer).
     pub fn new(m: usize) -> Self {
+        let m = m.max(2);
         Self {
             m,
             m_max0: m * 2,
@@ -74,9 +79,10 @@ impl HnswConfig {
         }
     }
 
-    /// Set ef_construction (builder pattern).
+    /// Set ef_construction (builder pattern). Values below 1 are clamped to 1,
+    /// since an empty construction beam would leave new nodes unconnected.
     pub fn with_ef_construction(mut self, ef: usize) -> Self {
-        self.ef_construction = ef;
+        self.ef_construction = ef.max(1);
         self
     }
 
@@ -235,6 +241,16 @@ impl HnswIndex {
     ) -> Result<Self> {
         let data_path = data_path.as_ref().to_path_buf();
         let store = VectorStore::create(&data_path, wal_path, dimension, metric)?;
+        // A stale graph snapshot from a previous database at these paths must
+        // not be loaded by a later `open`: slot/vector-id identity is reused,
+        // so a mismatched snapshot would install a wrong topology silently.
+        let mut graph_path = std::ffi::OsString::from(data_path.as_os_str());
+        graph_path.push(".graph");
+        match fs::remove_file(Path::new(&graph_path)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let rng = StdRng::seed_from_u64(config.random_seed);
         Ok(Self {
             store,
@@ -303,12 +319,7 @@ impl HnswIndex {
     ///
     /// Returns the assigned vector ID.
     pub fn insert(&mut self, vector: &[f32]) -> Result<u64> {
-        if vector.len() != self.store.dimension() as usize {
-            return Err(QuiverError::DimensionMismatch {
-                expected: self.store.dimension(),
-                actual: vector.len() as u32,
-            });
-        }
+        self.validate_vector(vector)?;
 
         // Write to storage (with WAL)
         let vector_id = self.store.insert(vector)?;
@@ -326,12 +337,7 @@ impl HnswIndex {
     /// [`VectorStore::insert_with_metadata`]) and can later be matched by
     /// [`Self::search_filtered`].
     pub fn insert_with_metadata(&mut self, vector: &[f32], metadata: Metadata) -> Result<u64> {
-        if vector.len() != self.store.dimension() as usize {
-            return Err(QuiverError::DimensionMismatch {
-                expected: self.store.dimension(),
-                actual: vector.len() as u32,
-            });
-        }
+        self.validate_vector(vector)?;
 
         let vector_id = self.store.insert_with_metadata(vector, metadata)?;
         let slot = self.store.len() - 1;
@@ -350,6 +356,9 @@ impl HnswIndex {
     pub fn insert_batch(&mut self, batch: &[&[f32]]) -> Result<Vec<u64>> {
         if batch.is_empty() {
             return Ok(Vec::new());
+        }
+        for vector in batch {
+            self.validate_vector(vector)?;
         }
         let ids = self.store.insert_batch(batch)?;
         let base_slot = self.store.len() - ids.len();
@@ -372,12 +381,34 @@ impl HnswIndex {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
+        for vector in batch {
+            self.validate_vector(vector)?;
+        }
         let ids = self.store.insert_batch_with_metadata(batch, metadata)?;
         let base_slot = self.store.len() - ids.len();
         for (i, vector) in batch.iter().enumerate() {
             self.insert_into_graph(base_slot + i, ids[i], vector);
         }
         Ok(ids)
+    }
+
+    /// Validate a vector before it touches storage or the graph: it must have
+    /// the index dimension and contain only finite values. Non-finite
+    /// components would produce NaN/inf distances that break the total order
+    /// the HNSW search relies on (and poison the server's shared lock).
+    fn validate_vector(&self, vector: &[f32]) -> Result<()> {
+        if vector.len() != self.store.dimension() as usize {
+            return Err(QuiverError::DimensionMismatch {
+                expected: self.store.dimension(),
+                actual: vector.len() as u32,
+            });
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(QuiverError::InvalidFormat(
+                "HNSW vectors must contain only finite values".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Search for the `k` nearest neighbors of the query vector.
@@ -407,16 +438,15 @@ impl HnswIndex {
         ef_search: usize,
         filter: &Filter,
     ) -> Result<Vec<SearchResult>> {
-        if query.len() != self.store.dimension() as usize {
-            return Err(QuiverError::DimensionMismatch {
-                expected: self.store.dimension(),
-                actual: query.len() as u32,
-            });
-        }
+        self.validate_vector(query)?;
 
         let entry_point = match self.entry_point {
             Some(ep) => ep,
-            None => return Err(QuiverError::EmptyIndex),
+            // A genuinely empty index is an error; an index whose nodes are
+            // all tombstones has no entry point left to descend from but is
+            // not empty — return no results.
+            None if self.nodes.is_empty() => return Err(QuiverError::EmptyIndex),
+            None => return Ok(Vec::new()),
         };
 
         if k == 0 {
@@ -440,16 +470,15 @@ impl HnswIndex {
     /// Shared core of [`Self::search`]: return up to `ef` non-deleted results
     /// sorted by distance (closest first).
     fn search_candidates(&self, query: &[f32], ef: usize) -> Result<Vec<SearchResult>> {
-        if query.len() != self.store.dimension() as usize {
-            return Err(QuiverError::DimensionMismatch {
-                expected: self.store.dimension(),
-                actual: query.len() as u32,
-            });
-        }
+        self.validate_vector(query)?;
 
         let entry_point = match self.entry_point {
             Some(ep) => ep,
-            None => return Err(QuiverError::EmptyIndex),
+            // A genuinely empty index is an error; an index whose nodes are
+            // all tombstones has no entry point left to descend from but is
+            // not empty — return no results.
+            None if self.nodes.is_empty() => return Err(QuiverError::EmptyIndex),
+            None => return Ok(Vec::new()),
         };
 
         // Phase 1: Greedy descent from the entry point through upper layers
@@ -484,6 +513,7 @@ impl HnswIndex {
         self.store.delete(vector_id)?;
         self.nodes[node_idx].deleted = true;
         self.tombstone_count += 1;
+        self.repoint_entry_point_if_needed(node_idx);
 
         // Check if compaction is needed
         if !self.nodes.is_empty() {
@@ -741,13 +771,19 @@ impl HnswIndex {
             ));
         }
 
-        let body_bytes = node_count * 24 + adjacency_len * 4 + level_block_count * 12;
-        let crc_start = GRAPH_HEADER_SIZE + body_bytes;
-        if data.len() < crc_start + 4 {
+        // The body must fit in the file. Use 128-bit arithmetic so crafted
+        // counts cannot wrap the bound check and under-allocate.
+        let body_bytes: u128 =
+            node_count as u128 * 24 + adjacency_len as u128 * 4 + level_block_count as u128 * 12;
+        let file_capacity = (data.len() as u128)
+            .saturating_sub(GRAPH_HEADER_SIZE as u128)
+            .saturating_sub(4); // body + 4-byte CRC
+        if body_bytes > file_capacity {
             return Err(QuiverError::InvalidFormat(
                 "graph snapshot body truncated".to_string(),
             ));
         }
+        let crc_start = GRAPH_HEADER_SIZE + body_bytes as usize;
         let body = &data[GRAPH_HEADER_SIZE..crc_start];
         let body_crc = (&data[crc_start..crc_start + 4]).read_u32::<LittleEndian>()?;
         if crc32fast::hash(body) != body_crc {
@@ -758,6 +794,10 @@ impl HnswIndex {
 
         let mut bcur = Cursor::new(body);
         let mut nodes = Vec::with_capacity(node_count);
+        // The writer emits nodes with level blocks packed contiguously, so the
+        // level offsets must be exactly cumulative. Verifying that (plus the
+        // per-node checks below) rules out overlapping or dangling blocks.
+        let mut expected_levels_offset: u64 = 0;
         for _ in 0..node_count {
             let slot = bcur.read_u64::<LittleEndian>()? as usize;
             let vector_id = bcur.read_u64::<LittleEndian>()?;
@@ -768,11 +808,18 @@ impl HnswIndex {
                     "graph snapshot node does not match stored vector".to_string(),
                 ));
             }
-            if levels_offset as usize + max_layer + 1 > level_block_count {
+            if levels_offset as u64 != expected_levels_offset {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot level offsets are not contiguous".to_string(),
+                ));
+            }
+            let next_offset = expected_levels_offset.saturating_add(max_layer as u64 + 1);
+            if next_offset > level_block_count as u64 {
                 return Err(QuiverError::InvalidFormat(
                     "graph snapshot level block out of range".to_string(),
                 ));
             }
+            expected_levels_offset = next_offset;
             nodes.push(HnswNode {
                 slot,
                 vector_id,
@@ -781,9 +828,29 @@ impl HnswIndex {
                 deleted: false,
             });
         }
+        if expected_levels_offset != level_block_count as u64 {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot level block count mismatch".to_string(),
+            ));
+        }
+        // Each slot appears at most once: a duplicate would yield duplicate
+        // search results and a vector with no graph node.
+        let mut slots: Vec<u64> = nodes.iter().map(|node| node.slot as u64).collect();
+        slots.sort_unstable();
+        if slots.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(QuiverError::InvalidFormat(
+                "graph snapshot references a slot twice".to_string(),
+            ));
+        }
         let mut adjacency_links = Vec::with_capacity(adjacency_len);
         for _ in 0..adjacency_len {
-            adjacency_links.push(bcur.read_u32::<LittleEndian>()?);
+            let link = bcur.read_u32::<LittleEndian>()?;
+            if link as usize >= node_count {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot adjacency link out of range".to_string(),
+                ));
+            }
+            adjacency_links.push(link);
         }
         let mut level_blocks = Vec::with_capacity(level_block_count);
         for _ in 0..level_block_count {
@@ -793,6 +860,11 @@ impl HnswIndex {
             if offset as usize + len as usize > adjacency_len {
                 return Err(QuiverError::InvalidFormat(
                     "graph snapshot adjacency block out of range".to_string(),
+                ));
+            }
+            if len > capacity {
+                return Err(QuiverError::InvalidFormat(
+                    "graph snapshot adjacency block exceeds capacity".to_string(),
                 ));
             }
             if capacity != self.config.m as u32 && capacity != self.config.m_max0 as u32 {
@@ -859,9 +931,43 @@ impl HnswIndex {
 
     // ── Private helpers ──────────────────────────────────────────────────
 
+    /// If the deleted node was the entry point, re-point the entry point at the
+    /// highest-layer live node (and lower `max_level` accordingly) so searches
+    /// stop paying a full descent through tombstone-only layers.
+    fn repoint_entry_point_if_needed(&mut self, deleted_idx: usize) {
+        let Some(entry) = self.entry_point else {
+            return;
+        };
+        if entry != deleted_idx {
+            return;
+        }
+        let mut best: Option<(usize, usize)> = None; // (max_layer, node_idx)
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.deleted {
+                continue;
+            }
+            match best {
+                Some((layer, _)) if node.max_layer <= layer => {}
+                _ => best = Some((node.max_layer, idx)),
+            }
+        }
+        match best {
+            Some((max_layer, idx)) => {
+                self.entry_point = Some(idx);
+                self.max_level = max_layer;
+            }
+            None => {
+                self.entry_point = None;
+                self.max_level = 0;
+            }
+        }
+    }
+
     /// Assign a random layer for a new node using the exponential decay formula.
     fn random_level(&mut self) -> usize {
-        let r: f64 = self.rng.random();
+        // `rng.random()` may return exactly 0.0, whose negated log is infinite
+        // and would assign the node to layer `usize::MAX`.
+        let r: f64 = self.rng.random::<f64>().max(f64::MIN_POSITIVE);
         (-r.ln() * self.config.ml).floor() as usize
     }
 
@@ -982,9 +1088,14 @@ impl HnswIndex {
             let candidates = self.search_layer_for_insert(vector, current, ef, level, metric);
 
             let m_level = if level == 0 { m_max0 } else { m };
+            // Tombstoned nodes remain eligible link targets: they stay
+            // traversable waypoints until compaction, and excluding them would
+            // leave a new node with zero links (and permanently unreachable)
+            // when its ef_construction neighborhood is entirely deleted.
+            // Search output still filters deleted nodes.
             let candidates: Vec<Candidate> = candidates
                 .into_iter()
-                .filter(|c| !self.nodes[c.node_idx].deleted && c.node_idx != new_node_idx)
+                .filter(|c| c.node_idx != new_node_idx)
                 .collect();
             let selected = self.select_neighbors_heuristic(vector, &candidates, m_level, metric);
 
@@ -1158,7 +1269,7 @@ impl HnswIndex {
 
         // Convert to sorted vec (closest first)
         let mut sorted: Vec<Candidate> = results.into_vec();
-        sorted.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        sorted.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         sorted
     }
 
@@ -1278,7 +1389,7 @@ impl HnswIndex {
 
             // Convert to sorted vec (closest first)
             let mut sorted: Vec<Candidate> = matches.into_vec();
-            sorted.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+            sorted.sort_by(|a, b| a.distance.total_cmp(&b.distance));
             sorted
         })
     }
@@ -1361,7 +1472,7 @@ impl HnswIndex {
                 }
             })
             .collect();
-        candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         let selected = self.select_neighbors_heuristic(node_vec, &candidates, max_conn, metric);
         self.replace_neighbors(node_idx, level, &selected);
     }
@@ -2368,9 +2479,178 @@ mod tests {
             assert!(
                 avg_recall > 0.90,
                 "filtered recall@{k} at {selectivity:.0}% selectivity must exceed 90%, \
-                 got {:.1}% (ef_search={ef_search}, n={n})",
+                  got {:.1}% (ef_search={ef_search}, n={n})",
                 avg_recall * 100.0
             );
         }
+    }
+
+    #[test]
+    fn test_config_m_is_clamped_to_two() {
+        // M < 2 made 1/ln(M) infinite, assigning every node to layer
+        // usize::MAX (a hang/OOM on first insert).
+        let config = HnswConfig::new(0);
+        assert_eq!(config.m, 2);
+        assert!(config.ml.is_finite());
+
+        let config = HnswConfig::new(1);
+        assert_eq!(config.m, 2);
+        assert!(config.ml.is_finite());
+
+        let config = HnswConfig::new(8).with_ef_construction(0);
+        assert_eq!(config.ef_construction, 1);
+
+        let (_dir, mut index) = setup(2, Metric::L2, 1);
+        index.insert(&[1.0, 0.0]).unwrap();
+        index.insert(&[2.0, 0.0]).unwrap();
+        assert!(index.entry_point.is_some());
+    }
+
+    #[test]
+    fn test_delete_entry_point_repoints() {
+        let (_dir, mut index) = setup(2, Metric::L2, 4);
+        for i in 0..50 {
+            index.insert(&[i as f32 * 0.1, 0.0]).unwrap();
+        }
+        let old_ep = index.entry_point.expect("entry point set");
+        let old_vid = index.nodes[old_ep].vector_id;
+
+        index.delete(old_vid).unwrap();
+
+        let new_ep = index.entry_point.expect("entry point re-pointed");
+        assert_ne!(new_ep, old_ep, "entry point must move off the tombstone");
+        assert!(!index.nodes[new_ep].deleted, "new entry point must be live");
+        assert_eq!(
+            index.nodes[new_ep].max_layer, index.max_level,
+            "entry point must sit at max_level"
+        );
+    }
+
+    #[test]
+    fn test_insert_into_deleted_cluster_stays_reachable() {
+        // When a new vector's ef_construction neighborhood consists entirely
+        // of tombstones, it must still connect (to the tombstones, which stay
+        // traversable waypoints until compaction). Filtering them out left the
+        // node with zero links — permanently unreachable to search.
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("isolated.qvdb");
+        let wal_path = dir.path().join("isolated.wal");
+        let mut config = HnswConfig::new(4).with_ef_construction(4);
+        config.max_tombstone_ratio = 1.0; // keep tombstones; compaction would rebuild
+        let mut index = HnswIndex::create(data_path, wal_path, 2, Metric::L2, config).unwrap();
+
+        // Far cluster.
+        for i in 0..12 {
+            index.insert(&[100.0 + i as f32, 0.0]).unwrap();
+        }
+        // Origin cluster, then delete all of it.
+        let cluster_ids: Vec<u64> = (0..6)
+            .map(|i| index.insert(&[i as f32 * 0.05, i as f32 * 0.03]).unwrap())
+            .collect();
+        for &id in &cluster_ids {
+            index.delete(id).unwrap();
+        }
+
+        // The new vector's four nearest neighbors are all tombstones.
+        let new_id = index.insert(&[0.02, 0.01]).unwrap();
+        let new_idx = index.nodes.len() - 1;
+        assert!(!index.nodes[new_idx].deleted);
+
+        let results = index.search(&[0.02, 0.01], 1, 100).unwrap();
+        assert!(
+            !results.is_empty(),
+            "search must return the new vector even though its neighborhood was deleted"
+        );
+        assert_eq!(
+            results[0].vector_id, new_id,
+            "the new vector is the closest live point and must be found"
+        );
+    }
+
+    #[test]
+    fn test_rejects_non_finite_vectors() {
+        let (_dir, mut index) = setup(2, Metric::L2, 4);
+        index.insert(&[1.0, 0.0]).unwrap();
+        assert!(index.insert(&[f32::NAN, 0.0]).is_err());
+        assert!(index.insert(&[1.0, f32::INFINITY]).is_err());
+        assert!(
+            index
+                .insert_batch(&[&[1.0, 0.0], &[f32::NAN, 0.0]])
+                .is_err()
+        );
+        // A NaN/inf query would produce NaN distances and panic the final
+        // sort (poisoning the server's lock) — reject it up front.
+        assert!(index.search(&[f32::NAN, 0.0], 1, 10).is_err());
+        assert!(index.search(&[1.0, f32::INFINITY], 1, 10).is_err());
+    }
+
+    #[test]
+    fn test_snapshot_load_validates_links_and_counts() {
+        let (_dir, mut index) = setup(2, Metric::L2, 4);
+        for i in 0..5 {
+            index.insert(&[i as f32, 0.0]).unwrap();
+        }
+        let n = 5;
+        let valid = index.serialize_graph();
+
+        // Positive control: the writer's own snapshot loads.
+        assert!(index.load_graph_from_bytes(&valid).is_ok());
+
+        // Corrupt the first adjacency link past the last node and fix the
+        // body CRC: must be rejected, not panic on the next search.
+        let mut bytes = valid.clone();
+        let link_offset = GRAPH_HEADER_SIZE + 24 * n;
+        bytes[link_offset..link_offset + 4].copy_from_slice(&(n as u32).to_le_bytes());
+        let body_end = bytes.len() - 4;
+        let body_crc = crc32fast::hash(&bytes[GRAPH_HEADER_SIZE..body_end]);
+        bytes[body_end..].copy_from_slice(&body_crc.to_le_bytes());
+        assert!(
+            index.load_graph_from_bytes(&bytes).is_err(),
+            "out-of-range adjacency link must be rejected"
+        );
+
+        // Astronomical node_count must be rejected by the (128-bit) body
+        // bound before any allocation, not via a capacity-overflow panic.
+        let mut bytes = valid.clone();
+        bytes[32..40].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        let header_crc = crc32fast::hash(&bytes[..GRAPH_HEADER_SIZE - 4]);
+        bytes[GRAPH_HEADER_SIZE - 4..GRAPH_HEADER_SIZE].copy_from_slice(&header_crc.to_le_bytes());
+        assert!(
+            index.load_graph_from_bytes(&bytes).is_err(),
+            "oversized node_count must be rejected before allocation"
+        );
+    }
+
+    #[test]
+    fn test_create_removes_stale_graph_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("stale.qvdb");
+        let wal_path = dir.path().join("stale.wal");
+        let config = HnswConfig::new(4).with_ef_construction(10);
+
+        // Run A leaves a snapshot whose slot/ID layout (1..=5 in slots 0..5)
+        // a fresh run B would coincidentally validate against.
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 2, Metric::L2, config.clone()).unwrap();
+            for i in 0..5 {
+                index.insert(&[i as f32, 0.0]).unwrap();
+            }
+            index.flush().unwrap();
+        }
+        {
+            let mut index =
+                HnswIndex::create(&data_path, &wal_path, 2, Metric::L2, config.clone()).unwrap();
+            for i in 0..5 {
+                index.insert(&[i as f32, 100.0]).unwrap();
+            }
+        }
+
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        assert_eq!(index.len(), 5);
+        assert!(
+            !index.loaded_from_snapshot,
+            "a snapshot left over from a previous create must not be loaded"
+        );
     }
 }

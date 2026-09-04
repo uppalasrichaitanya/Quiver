@@ -36,7 +36,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{QuiverError, Result};
 use crate::metadata::Metadata;
 
 /// The type of operation recorded in a WAL entry.
@@ -98,7 +98,6 @@ impl Wal {
         self.write_entry(&entry_body)?;
         Ok(())
     }
-
     /// Append an insert entry with metadata to the WAL.
     pub fn log_insert_meta(
         &mut self,
@@ -235,25 +234,138 @@ impl Wal {
         Ok(())
     }
 
+    /// Truncate this WAL in place and rewrite it with exactly the given
+    /// entries (in order), fsynced. Used by `VectorStore::flush` to checkpoint
+    /// the log once the data file is durable: plain Insert entries become
+    /// replay-skips, while Delete and InsertMeta entries are retained (deletes
+    /// have no other durable home, and InsertMeta keeps the WAL as the
+    /// metadata fallback if the snapshot is later corrupted).
+    pub fn checkpoint(&mut self, keep: &[&WalEntry]) -> Result<()> {
+        // Rebuild the writer on a truncate handle so the file starts at
+        // offset 0. A truncate through a separate handle does not reset the
+        // existing append-mode handle's end-of-file position on Windows, so
+        // the next append would land at the old offset (sparse gap + orphaned
+        // bytes) instead of overwriting the log.
+        self.clear()?;
+        for entry in keep {
+            let body = match entry.op {
+                WalOp::Delete => Self::serialize_delete(entry.vector_id),
+                WalOp::InsertMeta => {
+                    let metadata = entry
+                        .metadata
+                        .as_ref()
+                        .expect("InsertMeta entry carries metadata");
+                    let data = entry
+                        .vector_data
+                        .as_ref()
+                        .expect("InsertMeta entry carries vector data");
+                    Self::serialize_insert_meta(entry.vector_id, metadata, data)
+                }
+                WalOp::Insert => {
+                    return Err(QuiverError::InvalidFormat(
+                        "WAL checkpoint must not retain Insert entries".to_owned(),
+                    ));
+                }
+            };
+            let frame = Self::entry_frame(&body)?;
+            self.writer.write_all(&frame)?;
+        }
+        self.flush()?;
+        Ok(())
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────
 
     fn write_entry(&mut self, body: &[u8]) -> Result<()> {
-        let entry_len = body.len() as u32;
+        let frame = Self::entry_frame(body)?;
+        self.writer.write_all(&frame)?;
+        Ok(())
+    }
+
+    /// Serialize one entry frame: length prefix + body + CRC32 checksum of the
+    /// length prefix and body.
+    ///
+    /// The length is a u32, so a body of 4 GiB or more is rejected instead of
+    /// being silently truncated to a wrong length prefix.
+    pub(crate) fn entry_frame(body: &[u8]) -> Result<Vec<u8>> {
+        let entry_len = u32::try_from(body.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "WAL entry body exceeds 4 GiB")
+        })?;
 
         // Compute checksum over length prefix + body
         let mut hasher = Hasher::new();
-        let mut len_bytes = Vec::with_capacity(4);
-        len_bytes.write_u32::<LittleEndian>(entry_len).unwrap();
+        let len_bytes = entry_len.to_le_bytes();
         hasher.update(&len_bytes);
         hasher.update(body);
         let checksum = hasher.finalize();
 
-        // Write: length prefix + body + checksum
-        self.writer.write_u32::<LittleEndian>(entry_len)?;
-        self.writer.write_all(body)?;
-        self.writer.write_u32::<LittleEndian>(checksum)?;
+        let mut frame = Vec::with_capacity(4 + body.len() + 4);
+        frame.extend_from_slice(&len_bytes);
+        frame.extend_from_slice(body);
+        frame.extend_from_slice(&checksum.to_le_bytes());
+        Ok(frame)
+    }
 
-        Ok(())
+    /// Scan the WAL for Delete entries, returning their vector IDs in order.
+    ///
+    /// Insert entry bodies (the bulk of an insert-heavy log) are skipped
+    /// without being parsed. Stops at the first torn or checksum-invalid
+    /// frame, mirroring `read_entries`.
+    pub fn delete_ids(path: impl AsRef<Path>) -> Result<Vec<u64>> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+        let mut deletes = Vec::new();
+        let mut offset: u64 = 0;
+
+        loop {
+            let entry_len = match reader.read_u32::<LittleEndian>() {
+                Ok(len) => match usize::try_from(len) {
+                    Ok(len) => len,
+                    Err(_) => break,
+                },
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            };
+            let total_entry_len = match 4_usize
+                .checked_add(entry_len)
+                .and_then(|len| len.checked_add(4))
+            {
+                Some(len) => len,
+                None => break,
+            };
+            let entry_end = match offset.checked_add(total_entry_len as u64) {
+                Some(end) => end,
+                None => break,
+            };
+            if entry_end > file_len {
+                break;
+            }
+            let mut body = vec![0u8; entry_len];
+            if reader.read_exact(&mut body).is_err() {
+                break;
+            }
+            let stored_checksum = match reader.read_u32::<LittleEndian>() {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let mut hasher = Hasher::new();
+            hasher.update(&(entry_len as u32).to_le_bytes());
+            hasher.update(&body);
+            if stored_checksum != hasher.finalize() {
+                break;
+            }
+            if body.first() == Some(&(WalOp::Delete as u8)) && body.len() >= 9 {
+                deletes.push(u64::from_le_bytes(body[1..9].try_into().unwrap()));
+            }
+            offset = entry_end;
+        }
+
+        Ok(deletes)
     }
 
     fn serialize_insert(vector_id: u64, data: &[f32]) -> Vec<u8> {
@@ -280,7 +392,7 @@ impl Wal {
         buf
     }
 
-    fn serialize_delete(vector_id: u64) -> Vec<u8> {
+    pub(crate) fn serialize_delete(vector_id: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + 8);
         buf.write_u8(WalOp::Delete as u8).unwrap();
         buf.write_u64::<LittleEndian>(vector_id).unwrap();
@@ -478,6 +590,47 @@ mod tests {
 
         let (entries, _) = Wal::read_entries(&path).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_retains_deletes_and_drops_inserts() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_insert(1, &[1.0, 2.0]).unwrap();
+            wal.log_insert(2, &[3.0, 4.0]).unwrap();
+            wal.log_delete(1).unwrap();
+            wal.log_insert_meta(3, &sample_metadata(), &[5.0, 6.0])
+                .unwrap();
+            wal.flush().unwrap();
+
+            let (entries, _) = Wal::read_entries(&path).unwrap();
+            let keep: Vec<&WalEntry> = entries
+                .iter()
+                .filter(|entry| entry.op != WalOp::Insert)
+                .collect();
+            wal.checkpoint(&keep).unwrap();
+        }
+
+        // Only the delete and the metadata entry survive; appends after the
+        // checkpoint still work.
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, WalOp::Delete);
+        assert_eq!(entries[0].vector_id, 1);
+        assert_eq!(entries[1].op, WalOp::InsertMeta);
+        assert_eq!(entries[1].vector_id, 3);
+        assert_eq!(entries[1].metadata.as_ref(), Some(&sample_metadata()));
+
+        let mut wal = Wal::open(&path).unwrap();
+        wal.log_insert(4, &[7.0]).unwrap();
+        wal.flush().unwrap();
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].op, WalOp::Insert);
+        assert_eq!(entries[2].vector_id, 4);
     }
 
     #[test]

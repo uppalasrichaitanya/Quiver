@@ -1,9 +1,10 @@
-//! Small local Python API for creating, inserting into, and searching a Quiver index.
+//! Small local Python API for creating, opening, inserting into, and
+//! searching a Quiver index.
 
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
-    types::{PyBool, PyDict, PyList},
+    types::{PyBool, PyDict, PyList, PyType},
 };
 use quiver_core::{
     distance::Metric,
@@ -74,10 +75,38 @@ impl Index {
         m: usize,
         ef_construction: usize,
     ) -> PyResult<Self> {
+        // Refuse to run over an existing database: `create` truncates the data
+        // file, WAL, and metadata snapshot, which would silently destroy a
+        // previously stored index.
+        if std::path::Path::new(&data_path).exists() || std::path::Path::new(&wal_path).exists() {
+            return Err(py_error(format!(
+                "database already exists at {data_path:?} (or WAL {wal_path:?}); \
+                 use Index.open to keep it"
+            )));
+        }
         let config = HnswConfig::new(m).with_ef_construction(ef_construction);
         Ok(Self {
             inner: HnswIndex::create(data_path, wal_path, dimension, Metric::Cosine, config)
                 .map_err(py_error)?,
+        })
+    }
+
+    /// Open an existing index created by [`Index::new`].
+    ///
+    /// Replays the WAL for crash recovery and reuses the persisted graph
+    /// topology snapshot when present.
+    #[pyo3(signature = (data_path, wal_path, m=16, ef_construction=100))]
+    #[classmethod]
+    fn open(
+        _cls: Bound<'_, PyType>,
+        data_path: String,
+        wal_path: String,
+        m: usize,
+        ef_construction: usize,
+    ) -> PyResult<Self> {
+        let config = HnswConfig::new(m).with_ef_construction(ef_construction);
+        Ok(Self {
+            inner: HnswIndex::open(data_path, wal_path, config).map_err(py_error)?,
         })
     }
 

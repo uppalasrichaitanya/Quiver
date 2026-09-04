@@ -75,21 +75,43 @@ async fn main() {
         .init();
     let data = env::var("QUIVER_DATA_PATH").unwrap_or_else(|_| "quiver-server.qvdb".into());
     let wal = env::var("QUIVER_WAL_PATH").unwrap_or_else(|_| "quiver-server.wal".into());
-    let dimension = env::var("QUIVER_DIMENSION")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(384);
+    let dimension = match env::var("QUIVER_DIMENSION") {
+        Ok(value) => match value.parse::<u32>() {
+            Ok(d) if d > 0 => d,
+            _ => {
+                eprintln!("QUIVER_DIMENSION must be a positive integer, got {value:?}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => 384,
+    };
     let config = HnswConfig::new(16);
-    let index = if std::path::Path::new(&data).exists() {
-        HnswIndex::open(&data, &wal, config)
-    } else {
-        HnswIndex::create(&data, &wal, dimension, Metric::Cosine, config)
+    let index = match std::path::Path::new(&data).exists() {
+        true => HnswIndex::open(&data, &wal, config),
+        false => HnswIndex::create(&data, &wal, dimension, Metric::Cosine, config),
+    };
+    let index = match index {
+        Ok(index) => index,
+        Err(e) => {
+            eprintln!("failed to open or create server index at {data}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if index.dimension() != dimension {
+        eprintln!(
+            "dimension mismatch: QUIVER_DIMENSION is {dimension} but the existing index at {data} has {} dimensions",
+            index.dimension()
+        );
+        std::process::exit(1);
     }
-    .expect("open or create server index");
     let bind = env::var("QUIVER_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .expect("bind server listener");
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("failed to bind {bind}: {e}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(address = %listener.local_addr().unwrap(), "Quiver server listening");
     let index = Arc::new(RwLock::new(index));
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -178,6 +200,14 @@ async fn search(
     State(state): State<AppState>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
+    if request.k < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "k must be at least 1".into(),
+            }),
+        ));
+    }
     let hits = run_search(
         &state.index.read().unwrap(),
         &request.vector,
@@ -233,9 +263,23 @@ async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Map a core error to an HTTP status: client mistakes (bad dimension, empty
+/// search target, missing ID) are 4xx; storage corruption and I/O failures are
+/// 5xx so clients and alerts don't misclassify server-side faults.
 fn api_error(error: quiver_core::error::QuiverError) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match &error {
+        quiver_core::error::QuiverError::DimensionMismatch { .. }
+        | quiver_core::error::QuiverError::EmptyIndex => StatusCode::BAD_REQUEST,
+        quiver_core::error::QuiverError::NotFound(_) => StatusCode::NOT_FOUND,
+        quiver_core::error::QuiverError::InvalidFormat(_)
+        | quiver_core::error::QuiverError::Io(_)
+        | quiver_core::error::QuiverError::WalChecksumMismatch { .. }
+        | quiver_core::error::QuiverError::UnsupportedMetric(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
     (
-        StatusCode::BAD_REQUEST,
+        status,
         Json(ErrorResponse {
             error: error.to_string(),
         }),

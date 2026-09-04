@@ -294,7 +294,18 @@ impl Filter {
     /// holds vacuously.
     pub fn matches(&self, metadata: &Metadata) -> bool {
         match self {
-            Filter::Eq { key, value } => metadata.get(key) == Some(value),
+            Filter::Eq { key, value } => match metadata.get(key) {
+                // Floats compare with total_cmp so NaN matches NaN: a
+                // vector whose metadata holds Float(NaN) would otherwise be
+                // unmatchable by any predicate (PartialEq says NaN != NaN).
+                Some(actual) => match (actual, value) {
+                    (MetaValue::Float(a), MetaValue::Float(b)) => {
+                        a.total_cmp(b) == std::cmp::Ordering::Equal
+                    }
+                    _ => actual == value,
+                },
+                None => false,
+            },
             Filter::And(filters) => filters.iter().all(|filter| filter.matches(metadata)),
         }
     }
@@ -350,6 +361,21 @@ mod tests {
         // Int(2024) != Float(2024.0): types must agree, not just values.
         assert!(!eq("year", 2024.0f64).matches(&md));
         assert!(!eq("score", 1i64).matches(&md));
+    }
+
+    #[test]
+    fn test_eq_nan_float_matches_nan() {
+        // With plain PartialEq, NaN != NaN, so a vector whose metadata holds
+        // Float(NaN) was unmatchable by any predicate. total_cmp makes NaN
+        // equal to itself while leaving every other float comparison intact.
+        let mut md = Metadata::new();
+        md.insert("score", f64::NAN);
+        assert!(eq("score", f64::NAN).matches(&md));
+
+        md.insert("other", 1.0f64);
+        assert!(eq("other", 1.0f64).matches(&md));
+        assert!(!eq("other", f64::NAN).matches(&md));
+        assert!(!eq("score", 1.0f64).matches(&md));
     }
 
     #[test]

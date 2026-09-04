@@ -78,6 +78,11 @@ impl IvfPqIndex {
             return Err(QuiverError::EmptyIndex);
         }
         let dimension = vectors[0].len();
+        if config.m == 0 {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ requires m >= 1".to_owned(),
+            ));
+        }
         if dimension == 0 || !dimension.is_multiple_of(config.m) {
             return Err(QuiverError::InvalidFormat(format!(
                 "IVF-PQ dimension {dimension} must be positive and divisible by m={}",
@@ -183,6 +188,35 @@ impl IvfPqIndex {
                 "vector count does not match assignment count".to_owned(),
             ));
         }
+        if nlist == 0 {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ requires nlist >= 1".to_owned(),
+            ));
+        }
+        if pq.dimension() != dimension {
+            return Err(QuiverError::InvalidFormat(format!(
+                "PQ dimension {} does not match index dimension {dimension}",
+                pq.dimension()
+            )));
+        }
+        for vector in &vectors {
+            if vector.len() != dimension {
+                return Err(QuiverError::DimensionMismatch {
+                    expected: dimension as u32,
+                    actual: vector.len() as u32,
+                });
+            }
+        }
+        // Codes are looked up without a range check in the search hot path, so
+        // external state must be validated up front.
+        for &code in &codes {
+            if code as usize >= pq.ksub() {
+                return Err(QuiverError::InvalidFormat(format!(
+                    "PQ code {code} out of range for ksub={}",
+                    pq.ksub()
+                )));
+            }
+        }
         let vectors_flat = vectors.iter().flatten().copied().collect();
         Self::assemble(
             dimension,
@@ -222,8 +256,11 @@ impl IvfPqIndex {
             counts.iter().map(|&c| Vec::with_capacity(c * m)).collect();
         for (slot, &cell) in assignments.iter().enumerate() {
             let cell = cell as usize;
-            list_slots[cell].push(slot as u32);
-            list_codes[cell].extend_from_slice(&codes[slot * m..(slot + 1) * m]);
+            let slot = u32::try_from(slot).map_err(|_| {
+                QuiverError::InvalidFormat("IVF-PQ supports at most 2^32 vectors".to_owned())
+            })?;
+            list_slots[cell].push(slot);
+            list_codes[cell].extend_from_slice(&codes[slot as usize * m..(slot as usize + 1) * m]);
         }
         Ok(Self {
             dimension,
@@ -280,7 +317,7 @@ impl IvfPqIndex {
         let ksub = self.pq.ksub();
 
         let want = if rerank_factor > 0 {
-            (k * rerank_factor).min(self.len)
+            k.saturating_mul(rerank_factor).min(self.len)
         } else {
             k
         };
@@ -524,10 +561,62 @@ mod tests {
         assert!(IvfPqIndex::build(&vectors, &IvfPqConfig::new(4, 3, 16)).is_err());
         // nlist zero
         assert!(IvfPqIndex::build(&vectors, &IvfPqConfig::new(0, 4, 16)).is_err());
+        // m zero used to panic in is_multiple_of(0); it must be a clean error
+        assert!(IvfPqIndex::build(&vectors, &IvfPqConfig::new(4, 0, 16)).is_err());
+        // fewer training vectors than ksub used to panic inside PQ::train
+        let small = blobs(&mut rng, 10, 16, 2);
+        assert!(IvfPqIndex::build(&small, &IvfPqConfig::new(4, 4, 64)).is_err());
 
         let index = IvfPqIndex::build(&vectors, &IvfPqConfig::new(4, 4, 16)).unwrap();
         assert!(index.search(&[0.0; 15], 1, 1, 0).is_err()); // wrong dim
         assert!(index.search(&[f32::NAN; 16], 1, 1, 0).is_err()); // non-finite
         assert!(index.search(&vectors[0], 0, 1, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn from_trained_validates_external_state() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let vectors = blobs(&mut rng, 16, 8, 2);
+        let pq =
+            crate::quantization::ProductQuantizer::train(&vectors, 2, 16, 4, &mut rng).unwrap();
+        let dim = 8;
+        let nlist = 2;
+        let n = vectors.len();
+        let coarse = vec![0.0f32; nlist * dim];
+        let assignments = vec![0u32; n];
+        let codes = vec![0u8; n * 2];
+
+        // Short stored vector: rerank used to index past the end.
+        let mut short = vectors.clone();
+        short[1].pop();
+        let result = IvfPqIndex::from_trained(
+            dim,
+            nlist,
+            pq.clone(),
+            coarse.clone(),
+            assignments.clone(),
+            codes.clone(),
+            short,
+        );
+        assert!(result.is_err());
+
+        // PQ trained on a different dimension than the index claims.
+        let result = IvfPqIndex::from_trained(
+            16,
+            nlist,
+            pq.clone(),
+            coarse.clone(),
+            assignments.clone(),
+            codes.clone(),
+            vectors.clone(),
+        );
+        assert!(result.is_err());
+
+        // Out-of-range code byte: the ADC lookup used to panic.
+        let mut bad_codes = codes.clone();
+        bad_codes[0] = 99;
+        let result =
+            IvfPqIndex::from_trained(dim, nlist, pq, coarse, assignments, bad_codes, vectors);
+        assert!(result.is_err());
     }
 }
