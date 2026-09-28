@@ -4,6 +4,11 @@
 //! requantizing the existing collection.
 
 use std::collections::BinaryHeap;
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::distance::Metric;
 use crate::error::{QuiverError, Result};
@@ -99,6 +104,135 @@ impl Sq8Index {
     /// Bytes used by compressed vector payloads, excluding calibration arrays.
     pub fn vector_bytes(&self) -> usize {
         self.vectors.len()
+    }
+
+    /// Save the index to `path` with CRC32 integrity checks (atomic tmp+rename).
+    ///
+    /// Format `QVSQ` v1: header (magic, version, metric, dim, count + header CRC)
+    /// then body (mins f32, scales f64, codes u8 + body CRC).
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        const MAGIC: &[u8; 4] = b"QVSQ";
+        let path = path.as_ref();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_all(MAGIC).unwrap();
+        buf.write_u8(1).unwrap();
+        buf.write_u8(self.metric as u8).unwrap();
+        buf.write_all(&[0u8; 2]).unwrap();
+        let dim = self.dimension();
+        let count = self.len();
+        let dim_u32 = u32::try_from(dim)
+            .map_err(|_| QuiverError::InvalidFormat("SQ8 dimension exceeds u32".to_owned()))?;
+        let count_u64 = count as u64;
+        buf.write_u32::<LittleEndian>(dim_u32).unwrap();
+        buf.write_u64::<LittleEndian>(count_u64).unwrap();
+        let header_crc = crc32fast::hash(&buf);
+        buf.write_u32::<LittleEndian>(header_crc).unwrap();
+
+        let body_start = buf.len();
+        for &v in self.quantizer.mins() {
+            buf.write_f32::<LittleEndian>(v).unwrap();
+        }
+        for &s in self.quantizer.scales() {
+            buf.write_f64::<LittleEndian>(s).unwrap();
+        }
+        buf.write_all(&self.vectors).unwrap();
+        let body_crc = crc32fast::hash(&buf[body_start..]);
+        buf.write_u32::<LittleEndian>(body_crc).unwrap();
+
+        let mut tmp = PathBuf::from(path.as_os_str());
+        tmp.as_mut_os_string().push(".tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load an index saved with [`Sq8Index::save`]. Rejects bad magic, version,
+    /// metric, CRC mismatches, and truncated bodies before allocating payloads.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        const MAGIC: &[u8; 4] = b"QVSQ";
+        const HEADER_LEN: usize = 4 + 1 + 1 + 2 + 4 + 8 + 4;
+        let data = fs::read(path.as_ref())?;
+        if data.len() < HEADER_LEN + 4 {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 snapshot too short".to_owned(),
+            ));
+        }
+        let mut cur = Cursor::new(&data);
+        let mut magic = [0u8; 4];
+        cur.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(QuiverError::InvalidFormat(
+                "invalid SQ8 snapshot magic".to_owned(),
+            ));
+        }
+        let version = cur.read_u8()?;
+        if version != 1 {
+            return Err(QuiverError::InvalidFormat(format!(
+                "unsupported SQ8 snapshot version: {version}"
+            )));
+        }
+        let metric_byte = cur.read_u8()?;
+        let mut reserved = [0u8; 2];
+        cur.read_exact(&mut reserved)?;
+        let dim = cur.read_u32::<LittleEndian>()? as usize;
+        let count = cur.read_u64::<LittleEndian>()? as usize;
+        let header_crc = cur.read_u32::<LittleEndian>()?;
+        if crc32fast::hash(&data[..HEADER_LEN - 4]) != header_crc {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 snapshot header checksum mismatch".to_owned(),
+            ));
+        }
+        let metric =
+            Metric::from_u8(metric_byte).ok_or(QuiverError::UnsupportedMetric(metric_byte))?;
+        if dim == 0 {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 snapshot has zero dimension".to_owned(),
+            ));
+        }
+        let body_bytes: u128 = dim as u128 * 4 + dim as u128 * 8 + count as u128 * dim as u128;
+        let capacity = (data.len() as u128)
+            .saturating_sub(HEADER_LEN as u128)
+            .saturating_sub(4);
+        if body_bytes > capacity {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 snapshot body truncated".to_owned(),
+            ));
+        }
+        let crc_start = HEADER_LEN + body_bytes as usize;
+        let body = &data[HEADER_LEN..crc_start];
+        let body_crc = (&data[crc_start..crc_start + 4]).read_u32::<LittleEndian>()?;
+        if crc32fast::hash(body) != body_crc {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 snapshot body checksum mismatch".to_owned(),
+            ));
+        }
+        let mut bcur = Cursor::new(body);
+        let mut mins = vec![0.0f32; dim];
+        for v in &mut mins {
+            *v = bcur.read_f32::<LittleEndian>()?;
+        }
+        let mut scales = vec![0.0f64; dim];
+        for s in &mut scales {
+            *s = bcur.read_f64::<LittleEndian>()?;
+        }
+        let mut vectors = vec![0u8; count * dim];
+        bcur.read_exact(&mut vectors)?;
+        let quantizer = ScalarQuantizer::from_parts(mins, scales)?;
+        if quantizer.dimension() != dim {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 calibration dimension mismatch".to_owned(),
+            ));
+        }
+        Ok(Self {
+            quantizer,
+            vectors,
+            metric,
+        })
     }
 
     fn l2_lookup(&self, query: &[f32]) -> Vec<f32> {
@@ -226,5 +360,50 @@ mod tests {
             recall += expected.intersection(&actual).count() as f32 / 10.0;
         }
         assert!(recall / 25.0 >= 0.95, "SQ8 recall was {}", recall / 25.0);
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_search() {
+        let vectors = vec![vec![0.0, 0.0], vec![5.0, 5.0], vec![10.0, 10.0]];
+        let index = Sq8Index::build(&vectors, Metric::L2).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "quiver-sq8-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.qvsq");
+        index.save(&path).unwrap();
+        let loaded = Sq8Index::load(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.dimension(), 2);
+        let a = index.search(&[4.9, 5.1], 2).unwrap();
+        let b = loaded.search(&[4.9, 5.1], 2).unwrap();
+        assert_eq!(a, b);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_corrupt_snapshot() {
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let index = Sq8Index::build(&vectors, Metric::L2).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "quiver-sq8-bad-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.qvsq");
+        index.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(Sq8Index::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

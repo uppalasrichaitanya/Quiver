@@ -96,6 +96,36 @@ impl ScalarQuantizer {
         self.mins.len()
     }
 
+    /// Borrow the per-dimension minima.
+    pub fn mins(&self) -> &[f32] {
+        &self.mins
+    }
+
+    /// Borrow the per-dimension scales.
+    pub fn scales(&self) -> &[f64] {
+        &self.scales
+    }
+
+    /// Rebuild a quantizer from stored calibration. Validates shape and finiteness.
+    pub fn from_parts(mins: Vec<f32>, scales: Vec<f64>) -> Result<Self> {
+        if mins.is_empty() || mins.len() != scales.len() {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 calibration length mismatch".to_owned(),
+            ));
+        }
+        if mins.iter().any(|v| !v.is_finite()) || scales.iter().any(|v| !v.is_finite()) {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 calibration must contain only finite values".to_owned(),
+            ));
+        }
+        if scales.iter().any(|&s| s < 0.0) {
+            return Err(QuiverError::InvalidFormat(
+                "SQ8 scales must be non-negative".to_owned(),
+            ));
+        }
+        Ok(Self { mins, scales })
+    }
+
     #[inline]
     pub(crate) fn reconstruct(&self, dimension: usize, code: u8) -> f32 {
         (self.mins[dimension] as f64 + code as f64 * self.scales[dimension])

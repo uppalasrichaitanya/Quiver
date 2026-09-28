@@ -13,6 +13,11 @@
 //! reference in `benchmarks/pq_reference.py` (see the cross-validation test).
 
 use std::collections::BinaryHeap;
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Write};
+use std::path::Path;
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::distance::l2_squared;
 use crate::error::{QuiverError, Result};
@@ -389,6 +394,242 @@ impl IvfPqIndex {
         self.vectors.len() * size_of::<f32>()
     }
 
+    /// Save the index to `path` with CRC32 integrity checks (atomic tmp+rename).
+    ///
+    /// Format `QVPQ` v1: header (magic, version, dims, counts + header CRC),
+    /// then body (coarse f32, codebooks f32, per-cell slot/code runs,
+    /// full-precision vectors + body CRC).
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        const MAGIC: &[u8; 4] = b"QVPQ";
+        let path = path.as_ref();
+        let store_flag: u8 = u8::from(!self.vectors.is_empty());
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_all(MAGIC).unwrap();
+        buf.write_u8(1).unwrap();
+        buf.write_u8(store_flag).unwrap();
+        buf.write_all(&[0u8; 2]).unwrap();
+        for v in [
+            self.dimension as u64,
+            self.nlist as u64,
+            self.pq.m() as u64,
+            self.pq.ksub() as u64,
+            self.pq.dsub() as u64,
+            self.len as u64,
+        ] {
+            let w = u32::try_from(v)
+                .map_err(|_| QuiverError::InvalidFormat("IVF-PQ value exceeds u32".to_owned()))?;
+            buf.write_u32::<LittleEndian>(w).unwrap();
+        }
+        let coarse_len = self.coarse.len() as u64;
+        let codebook_len = self.pq.codebooks().len() as u64;
+        let vectors_len = self.vectors.len() as u64;
+        buf.write_u64::<LittleEndian>(coarse_len).unwrap();
+        buf.write_u64::<LittleEndian>(codebook_len).unwrap();
+        buf.write_u64::<LittleEndian>(vectors_len).unwrap();
+        let header_crc = crc32fast::hash(&buf);
+        buf.write_u32::<LittleEndian>(header_crc).unwrap();
+
+        let body_start = buf.len();
+        for &v in &self.coarse {
+            buf.write_f32::<LittleEndian>(v).unwrap();
+        }
+        for &v in self.pq.codebooks() {
+            buf.write_f32::<LittleEndian>(v).unwrap();
+        }
+        for cell in 0..self.nlist {
+            let slots = &self.list_slots[cell];
+            buf.write_u64::<LittleEndian>(slots.len() as u64).unwrap();
+            for &s in slots {
+                buf.write_u32::<LittleEndian>(s).unwrap();
+            }
+            buf.write_all(&self.list_codes[cell]).unwrap();
+        }
+        for &v in &self.vectors {
+            buf.write_f32::<LittleEndian>(v).unwrap();
+        }
+        let body_crc = crc32fast::hash(&buf[body_start..]);
+        buf.write_u32::<LittleEndian>(body_crc).unwrap();
+
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load an index saved with [`IvfPqIndex::save`]. Validates magic, version,
+    /// shape, code ranges, and CRCs with 128-bit pre-allocation bounds.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        const MAGIC: &[u8; 4] = b"QVPQ";
+        const HEADER_LEN: usize = 4 + 1 + 1 + 2 + 6 * 4 + 3 * 8 + 4;
+        let data = fs::read(path.as_ref())?;
+        if data.len() < HEADER_LEN + 4 {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot too short".to_owned(),
+            ));
+        }
+        let mut cur = Cursor::new(&data);
+        let mut magic = [0u8; 4];
+        cur.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(QuiverError::InvalidFormat(
+                "invalid IVF-PQ snapshot magic".to_owned(),
+            ));
+        }
+        let version = cur.read_u8()?;
+        if version != 1 {
+            return Err(QuiverError::InvalidFormat(format!(
+                "unsupported IVF-PQ snapshot version: {version}"
+            )));
+        }
+        let store_flag = cur.read_u8()?;
+        if store_flag > 1 {
+            return Err(QuiverError::InvalidFormat(
+                "invalid IVF-PQ store_vectors flag".to_owned(),
+            ));
+        }
+        let mut reserved = [0u8; 2];
+        cur.read_exact(&mut reserved)?;
+        let dimension = cur.read_u32::<LittleEndian>()? as usize;
+        let nlist = cur.read_u32::<LittleEndian>()? as usize;
+        let m = cur.read_u32::<LittleEndian>()? as usize;
+        let ksub = cur.read_u32::<LittleEndian>()? as usize;
+        let dsub = cur.read_u32::<LittleEndian>()? as usize;
+        let len = cur.read_u32::<LittleEndian>()? as usize;
+        let coarse_len = cur.read_u64::<LittleEndian>()? as usize;
+        let codebook_len = cur.read_u64::<LittleEndian>()? as usize;
+        let vectors_len = cur.read_u64::<LittleEndian>()? as usize;
+        let header_crc = cur.read_u32::<LittleEndian>()?;
+        if crc32fast::hash(&data[..HEADER_LEN - 4]) != header_crc {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot header checksum mismatch".to_owned(),
+            ));
+        }
+        if dimension == 0 || nlist == 0 || m == 0 || ksub == 0 || ksub > 256 || dsub == 0 {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot has invalid shape".to_owned(),
+            ));
+        }
+        if dimension != m * dsub {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ dimension must equal m * dsub".to_owned(),
+            ));
+        }
+        if coarse_len != nlist * dimension || codebook_len != m * ksub * dsub {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot buffer length mismatch".to_owned(),
+            ));
+        }
+        let want_vectors = if store_flag == 1 { len * dimension } else { 0 };
+        if vectors_len != want_vectors {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot vector buffer mismatch".to_owned(),
+            ));
+        }
+        // Pre-allocation bound: fixed buffers + per-cell runs (len u64 +
+        // slots u32 + codes u8*m per vector) + vectors + trailing CRC.
+        let runs_fixed: u128 = nlist as u128 * 8;
+        let payload: u128 = len as u128 * (4 + m as u128);
+        let fixed: u128 =
+            coarse_len as u128 * 4 + codebook_len as u128 * 4 + vectors_len as u128 * 4;
+        let capacity = (data.len() as u128)
+            .saturating_sub(HEADER_LEN as u128)
+            .saturating_sub(4);
+        if runs_fixed + payload + fixed > capacity {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot body truncated".to_owned(),
+            ));
+        }
+        let crc_start = data.len() - 4;
+        let body = &data[HEADER_LEN..crc_start];
+        let body_crc = (&data[crc_start..]).read_u32::<LittleEndian>()?;
+        if crc32fast::hash(body) != body_crc {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot body checksum mismatch".to_owned(),
+            ));
+        }
+        let mut bcur = Cursor::new(body);
+        let mut coarse = vec![0.0f32; coarse_len];
+        for v in &mut coarse {
+            *v = bcur.read_f32::<LittleEndian>()?;
+        }
+        if coarse.iter().any(|v| !v.is_finite()) {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ coarse centroids must be finite".to_owned(),
+            ));
+        }
+        let mut codebooks = vec![0.0f32; codebook_len];
+        for v in &mut codebooks {
+            *v = bcur.read_f32::<LittleEndian>()?;
+        }
+        let pq = ProductQuantizer::from_codebooks(m, ksub, dsub, codebooks)?;
+        let mut list_slots: Vec<Vec<u32>> = Vec::with_capacity(nlist);
+        let mut list_codes: Vec<Vec<u8>> = Vec::with_capacity(nlist);
+        let mut total = 0usize;
+        for _ in 0..nlist {
+            let cell_len = bcur.read_u64::<LittleEndian>()? as usize;
+            if cell_len > len || total + cell_len > len {
+                return Err(QuiverError::InvalidFormat(
+                    "IVF-PQ cell run exceeds index length".to_owned(),
+                ));
+            }
+            let mut slots = vec![0u32; cell_len];
+            for s in &mut slots {
+                *s = bcur.read_u32::<LittleEndian>()?;
+                if *s as usize >= len {
+                    return Err(QuiverError::InvalidFormat(
+                        "IVF-PQ slot out of range".to_owned(),
+                    ));
+                }
+            }
+            let mut codes = vec![0u8; cell_len * m];
+            bcur.read_exact(&mut codes)?;
+            for &c in &codes {
+                if c as usize >= ksub {
+                    return Err(QuiverError::InvalidFormat(
+                        "IVF-PQ code out of range".to_owned(),
+                    ));
+                }
+            }
+            total += cell_len;
+            list_slots.push(slots);
+            list_codes.push(codes);
+        }
+        if total != len {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ cell runs do not sum to index length".to_owned(),
+            ));
+        }
+        let mut vectors = vec![0.0f32; vectors_len];
+        for v in &mut vectors {
+            *v = bcur.read_f32::<LittleEndian>()?;
+        }
+        if vectors.iter().any(|v| !v.is_finite()) {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ stored vectors must be finite".to_owned(),
+            ));
+        }
+        if bcur.position() != body.len() as u64 {
+            return Err(QuiverError::InvalidFormat(
+                "IVF-PQ snapshot has trailing bytes".to_owned(),
+            ));
+        }
+        Ok(Self {
+            dimension,
+            nlist,
+            pq,
+            coarse,
+            list_slots,
+            list_codes,
+            vectors,
+            len,
+        })
+    }
+
     fn nearest_cells(&self, query: &[f32], nprobe: usize) -> Vec<usize> {
         let mut dists: Vec<(f32, usize)> = (0..self.nlist)
             .map(|cell| {
@@ -618,5 +859,51 @@ mod tests {
         let result =
             IvfPqIndex::from_trained(dim, nlist, pq, coarse, assignments, bad_codes, vectors);
         assert!(result.is_err());
+    }
+
+    fn tmp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_search() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let vectors = blobs(&mut rng, 300, 16, 4);
+        let config = IvfPqConfig::new(4, 4, 16);
+        let index = IvfPqIndex::build(&vectors, &config).unwrap();
+        let dir = tmp_dir("quiver-ivfpq");
+        let path = dir.join("index.qvpq");
+        index.save(&path).unwrap();
+        let loaded = IvfPqIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), 300);
+        assert_eq!(loaded.dimension(), 16);
+        let a = index.search(&vectors[7], 5, 4, 2).unwrap();
+        let b = loaded.search(&vectors[7], 5, 4, 2).unwrap();
+        assert_eq!(a, b);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_corrupt_snapshot() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+        let vectors = blobs(&mut rng, 100, 8, 2);
+        let index = IvfPqIndex::build(&vectors, &IvfPqConfig::new(2, 2, 8)).unwrap();
+        let dir = tmp_dir("quiver-ivfpq-bad");
+        let path = dir.join("index.qvpq");
+        index.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(IvfPqIndex::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
