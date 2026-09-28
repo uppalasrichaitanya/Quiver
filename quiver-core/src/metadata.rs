@@ -9,11 +9,11 @@
 //! - [`MetaValue`] is a scalar: string, integer, float, or boolean.
 //! - [`Metadata`] maps string keys to [`MetaValue`]s. It is backed by a
 //!   [`BTreeMap`] so iteration and serialization order are deterministic.
-//! - [`Filter`] is the query predicate. The initial (naive) scope is equality
-//!   tests plus conjunction; `Or`, `In`, and range predicates are deferred.
+//! - [`Filter`] is the query predicate: equality, disjunction, membership,
+//!   numeric/string ranges, and conjunction.
 //!
-//! [`Filter::matches`] is total: a missing key never matches an `Eq`, and an
-//! empty `And` matches everything.
+//! [`Filter::matches`] is total: a missing key never matches, an empty `And`
+//! matches everything, and an empty `Or` matches nothing.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
@@ -267,14 +267,12 @@ impl Metadata {
 
 /// A predicate over vector metadata, used to restrict search results.
 ///
-/// The initial scope is deliberately naive: equality tests and conjunction.
-/// `Or`, `In`, and range predicates are deferred.
+/// All variants are total (see [`Filter::matches`]): a missing key never
+/// matches, and values of different types never match (`Int(1)` is not equal
+/// to `Float(1.0)`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Filter {
     /// Matches when the metadata contains `key` with exactly `value`.
-    ///
-    /// A missing key never matches, and values of different types never
-    /// match (`Int(1)` is not equal to `Float(1.0)`).
     Eq {
         /// The metadata key to test.
         key: String,
@@ -285,29 +283,91 @@ pub enum Filter {
     ///
     /// An empty list matches everything (vacuous truth).
     And(Vec<Filter>),
+    /// Matches when at least one contained filter matches.
+    ///
+    /// An empty list matches nothing (dual of [`Filter::And`]).
+    Or(Vec<Filter>),
+    /// Matches when the metadata contains `key` with a value equal to one of
+    /// `values`.
+    ///
+    /// An empty `values` list matches nothing. A missing key never matches.
+    In {
+        /// The metadata key to test.
+        key: String,
+        /// The accepted values (compared with [`Filter::Eq`] semantics).
+        values: Vec<MetaValue>,
+    },
+    /// Matches when the metadata contains `key` with a value inside the
+    /// inclusive bounds.
+    ///
+    /// Bounds compare only against values of the same type (`Int` with `Int`,
+    /// `Float` with `Float` via `total_cmp`, `Str` with `Str`
+    /// lexicographically); `Bool` bounds never match, and mixed-type
+    /// comparisons never match. A missing key never matches. When both bounds
+    /// are `None`, any present key matches (existence check).
+    Range {
+        /// The metadata key to test.
+        key: String,
+        /// Inclusive lower bound, if any.
+        min: Option<MetaValue>,
+        /// Inclusive upper bound, if any.
+        max: Option<MetaValue>,
+    },
 }
 
 impl Filter {
     /// Evaluate the predicate against a metadata map.
     ///
-    /// Total: never errors. Missing keys fail `Eq`, and an empty `And`
-    /// holds vacuously.
+    /// Total: never errors. Missing keys fail every variant except an empty
+    /// `And`; an empty `Or`/`In` matches nothing.
     pub fn matches(&self, metadata: &Metadata) -> bool {
         match self {
             Filter::Eq { key, value } => match metadata.get(key) {
-                // Floats compare with total_cmp so NaN matches NaN: a
-                // vector whose metadata holds Float(NaN) would otherwise be
-                // unmatchable by any predicate (PartialEq says NaN != NaN).
-                Some(actual) => match (actual, value) {
-                    (MetaValue::Float(a), MetaValue::Float(b)) => {
-                        a.total_cmp(b) == std::cmp::Ordering::Equal
-                    }
-                    _ => actual == value,
-                },
+                Some(actual) => values_equal(actual, value),
                 None => false,
             },
             Filter::And(filters) => filters.iter().all(|filter| filter.matches(metadata)),
+            Filter::Or(filters) => filters.iter().any(|filter| filter.matches(metadata)),
+            Filter::In { key, values } => match metadata.get(key) {
+                Some(actual) => values.iter().any(|value| values_equal(actual, value)),
+                None => false,
+            },
+            Filter::Range { key, min, max } => match metadata.get(key) {
+                Some(actual) => {
+                    let lower_ok = min.as_ref().is_none_or(|bound| {
+                        compare_bound(actual, bound)
+                            .is_some_and(|order| order != std::cmp::Ordering::Less)
+                    });
+                    let upper_ok = max.as_ref().is_none_or(|bound| {
+                        compare_bound(actual, bound)
+                            .is_some_and(|order| order != std::cmp::Ordering::Greater)
+                    });
+                    lower_ok && upper_ok
+                }
+                None => false,
+            },
         }
+    }
+}
+
+/// Strict value equality with `total_cmp` float semantics so NaN matches NaN
+/// (see the `Eq` docs); every other comparison is plain `PartialEq`.
+fn values_equal(actual: &MetaValue, expected: &MetaValue) -> bool {
+    match (actual, expected) {
+        (MetaValue::Float(a), MetaValue::Float(b)) => a.total_cmp(b) == std::cmp::Ordering::Equal,
+        _ => actual == expected,
+    }
+}
+
+/// Compare a metadata value against a range bound. Returns `None` when the
+/// types are not comparable (`Bool`, or mismatched types); otherwise the
+/// ordering of `actual` relative to `bound`.
+fn compare_bound(actual: &MetaValue, bound: &MetaValue) -> Option<std::cmp::Ordering> {
+    match (actual, bound) {
+        (MetaValue::Int(a), MetaValue::Int(b)) => Some(a.cmp(b)),
+        (MetaValue::Float(a), MetaValue::Float(b)) => Some(a.total_cmp(b)),
+        (MetaValue::Str(a), MetaValue::Str(b)) => Some(a.cmp(b)),
+        _ => None,
     }
 }
 
@@ -586,5 +646,172 @@ mod tests {
         .unwrap();
         assert!(filter.matches(&sample_metadata()));
         assert!(!filter.matches(&Metadata::new()));
+    }
+
+    #[test]
+    fn test_or_matches_any_disjunct() {
+        let md = sample_metadata();
+        let filter = Filter::Or(vec![eq("category", "sports"), eq("year", 2024i64)]);
+        assert!(filter.matches(&md));
+        let filter = Filter::Or(vec![eq("category", "sports"), eq("year", 1999i64)]);
+        assert!(!filter.matches(&md));
+    }
+
+    #[test]
+    fn test_or_empty_matches_nothing() {
+        assert!(!Filter::Or(Vec::new()).matches(&Metadata::new()));
+        assert!(!Filter::Or(Vec::new()).matches(&sample_metadata()));
+    }
+
+    #[test]
+    fn test_or_nests_with_and() {
+        let md = sample_metadata();
+        let filter = Filter::Or(vec![
+            Filter::And(vec![eq("category", "science"), eq("year", 2024i64)]),
+            eq("category", "sports"),
+        ]);
+        assert!(filter.matches(&md));
+        let filter = Filter::Or(vec![
+            Filter::And(vec![eq("category", "science"), eq("year", 1999i64)]),
+            eq("category", "sports"),
+        ]);
+        assert!(!filter.matches(&md));
+    }
+
+    #[test]
+    fn test_in_matches_membership() {
+        let md = sample_metadata();
+        let filter = Filter::In {
+            key: "category".to_owned(),
+            values: vec!["sports".into(), "science".into()],
+        };
+        assert!(filter.matches(&md));
+        let filter = Filter::In {
+            key: "category".to_owned(),
+            values: vec!["sports".into(), "art".into()],
+        };
+        assert!(!filter.matches(&md));
+    }
+
+    #[test]
+    fn test_in_empty_or_missing_matches_nothing() {
+        let md = sample_metadata();
+        let filter = Filter::In {
+            key: "category".to_owned(),
+            values: Vec::new(),
+        };
+        assert!(!filter.matches(&md));
+        let filter = Filter::In {
+            key: "nonexistent".to_owned(),
+            values: vec!["science".into()],
+        };
+        assert!(!filter.matches(&md));
+        assert!(!filter.matches(&Metadata::new()));
+    }
+
+    #[test]
+    fn test_in_float_nan_matches_nan() {
+        let mut md = Metadata::new();
+        md.insert("score", f64::NAN);
+        let filter = Filter::In {
+            key: "score".to_owned(),
+            values: vec![MetaValue::Float(f64::NAN)],
+        };
+        assert!(filter.matches(&md));
+    }
+
+    #[test]
+    fn test_range_int_bounds_inclusive() {
+        let md = sample_metadata(); // year = 2024
+        let in_range = Filter::Range {
+            key: "year".to_owned(),
+            min: Some(2020i64.into()),
+            max: Some(2024i64.into()),
+        };
+        assert!(in_range.matches(&md));
+        let out_of_range = Filter::Range {
+            key: "year".to_owned(),
+            min: Some(2025i64.into()),
+            max: None,
+        };
+        assert!(!out_of_range.matches(&md));
+        let open_upper = Filter::Range {
+            key: "year".to_owned(),
+            min: None,
+            max: Some(2024i64.into()),
+        };
+        assert!(open_upper.matches(&md));
+    }
+
+    #[test]
+    fn test_range_float_and_str() {
+        let md = sample_metadata(); // score = 0.5, category = "science"
+        let float_range = Filter::Range {
+            key: "score".to_owned(),
+            min: Some(0.5f64.into()),
+            max: Some(1.0f64.into()),
+        };
+        assert!(float_range.matches(&md));
+        let str_range = Filter::Range {
+            key: "category".to_owned(),
+            min: Some("a".into()),
+            max: Some("z".into()),
+        };
+        assert!(str_range.matches(&md));
+        let str_out = Filter::Range {
+            key: "category".to_owned(),
+            min: Some("t".into()),
+            max: None,
+        };
+        assert!(!str_out.matches(&md));
+    }
+
+    #[test]
+    fn test_range_rejects_mismatched_or_bool_types() {
+        let md = sample_metadata();
+        let mixed = Filter::Range {
+            key: "year".to_owned(),
+            min: Some(2020.0f64.into()),
+            max: None,
+        };
+        assert!(!mixed.matches(&md));
+        let on_bool = Filter::Range {
+            key: "published".to_owned(),
+            min: None,
+            max: None,
+        };
+        // Both bounds None means existence: present key matches.
+        assert!(on_bool.matches(&md));
+        let bool_bound = Filter::Range {
+            key: "published".to_owned(),
+            min: Some(true.into()),
+            max: None,
+        };
+        assert!(!bool_bound.matches(&md));
+        let missing = Filter::Range {
+            key: "nonexistent".to_owned(),
+            min: None,
+            max: None,
+        };
+        assert!(!missing.matches(&md));
+    }
+
+    #[test]
+    fn test_serde_new_filters_roundtrip() {
+        let filter = Filter::Or(vec![
+            Filter::In {
+                key: "category".to_owned(),
+                values: vec!["science".into(), "sports".into()],
+            },
+            Filter::Range {
+                key: "year".to_owned(),
+                min: Some(2020i64.into()),
+                max: Some(2024i64.into()),
+            },
+        ]);
+        let json = serde_json::to_string(&filter).unwrap();
+        let parsed: Filter = serde_json::from_str(&json).unwrap();
+        assert_eq!(filter, parsed);
+        assert!(parsed.matches(&sample_metadata()));
     }
 }

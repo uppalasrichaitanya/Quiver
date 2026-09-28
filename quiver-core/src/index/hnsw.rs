@@ -2113,6 +2113,54 @@ mod tests {
     }
 
     #[test]
+    fn test_search_filtered_or_in_range_predicates() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        // Vector i sits at [i, 0] with metadata cat = i % 4.
+        for i in 0..16 {
+            index
+                .insert_with_metadata(&[i as f32, 0.0], int_metadata("cat", i % 4))
+                .unwrap();
+        }
+
+        // Or: cat == 1 or cat == 3 -> ids {2,4,6,8,10,12,14,16} by distance.
+        let filter = Filter::Or(vec![eq("cat", 1i64), eq("cat", 3i64)]);
+        let ids: Vec<u64> = index
+            .search_filtered(&[0.0, 0.0], 16, 50, &filter)
+            .unwrap()
+            .iter()
+            .map(|r| r.vector_id)
+            .collect();
+        assert_eq!(ids, vec![2, 4, 6, 8, 10, 12, 14, 16]);
+
+        // In: cat in {0, 2} -> ids {1,3,5,7,9,11,13,15}.
+        let filter = Filter::In {
+            key: "cat".to_owned(),
+            values: vec![0i64.into(), 2i64.into()],
+        };
+        let ids: Vec<u64> = index
+            .search_filtered(&[0.0, 0.0], 16, 50, &filter)
+            .unwrap()
+            .iter()
+            .map(|r| r.vector_id)
+            .collect();
+        assert_eq!(ids, vec![1, 3, 5, 7, 9, 11, 13, 15]);
+
+        // Range: 1 <= cat <= 2 -> ids {2,3,6,7,10,11,14,15}.
+        let filter = Filter::Range {
+            key: "cat".to_owned(),
+            min: Some(1i64.into()),
+            max: Some(2i64.into()),
+        };
+        let ids: Vec<u64> = index
+            .search_filtered(&[0.0, 0.0], 16, 50, &filter)
+            .unwrap()
+            .iter()
+            .map(|r| r.vector_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 6, 7, 10, 11, 14, 15]);
+    }
+
+    #[test]
     fn test_search_filtered_ignores_vectors_without_metadata() {
         let (_dir, mut index) = setup(2, Metric::L2, 8);
         index.insert(&[0.0, 0.0]).unwrap(); // closest, but no metadata

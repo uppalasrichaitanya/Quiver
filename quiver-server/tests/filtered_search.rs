@@ -283,3 +283,60 @@ fn metadata_and_filter_survive_graceful_restart() {
     assert!(ids.contains(&id_science_1999), "response: {body}");
     drop(second);
 }
+
+#[test]
+fn filtered_search_supports_or_in_and_range() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("server.qvdb");
+    let wal = directory.path().join("server.wal");
+    let address = unused_address();
+
+    let server = start_server(&data, &wal, address);
+    wait_until_ready(address);
+    let (id_science_2024, id_sports_2024, id_science_1999, _id_bare) = insert_fixture(address);
+
+    // Or: science or sports matches all three metadata vectors.
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":10,"ef_search":50,
+            "filter":{"Or":[{"Eq":{"key":"category","value":"science"}},
+                            {"Eq":{"key":"category","value":"sports"}}]}}"#,
+    );
+    assert_eq!(status, 200, "Or response: {body}");
+    let ids = hit_ids(&body);
+    assert_eq!(ids.len(), 3, "Or response: {body}");
+    assert!(ids.contains(&id_science_2024));
+    assert!(ids.contains(&id_sports_2024));
+    assert!(ids.contains(&id_science_1999));
+
+    // In: year in [2024] matches the two 2024 vectors.
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":10,"ef_search":50,
+            "filter":{"In":{"key":"year","values":[2024]}}}"#,
+    );
+    assert_eq!(status, 200, "In response: {body}");
+    let ids = hit_ids(&body);
+    assert_eq!(ids.len(), 2, "In response: {body}");
+    assert!(ids.contains(&id_science_2024));
+    assert!(ids.contains(&id_sports_2024));
+
+    // Range: 2000 <= year <= 2024 matches the two 2024 vectors.
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":10,"ef_search":50,
+            "filter":{"Range":{"key":"year","min":2000,"max":2024}}}"#,
+    );
+    assert_eq!(status, 200, "Range response: {body}");
+    let ids = hit_ids(&body);
+    assert_eq!(ids.len(), 2, "Range response: {body}");
+    assert!(ids.contains(&id_science_2024));
+    assert!(ids.contains(&id_sports_2024));
+    drop(server);
+}
