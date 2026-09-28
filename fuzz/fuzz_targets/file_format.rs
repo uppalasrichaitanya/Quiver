@@ -32,7 +32,7 @@ fn mutated_valid_file(input: &[u8], version: u8) -> Vec<u8> {
     file.extend_from_slice(&1.0_f32.to_le_bytes());
     file.extend_from_slice(&2.0_f32.to_le_bytes());
 
-    for chunk in input.chunks_exact(2) {
+    for chunk in input.as_chunks::<2>().0 {
         let index = chunk[0] as usize % file.len();
         file[index] ^= chunk[1];
     }

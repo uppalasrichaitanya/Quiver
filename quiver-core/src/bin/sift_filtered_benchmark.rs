@@ -429,8 +429,10 @@ where
         let mut bytes = vec![0_u8; dimension * 4];
         reader.read_exact(&mut bytes)?;
         let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|value| f32::from_le_bytes(value.try_into().expect("four-byte float")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| f32::from_le_bytes(*value))
             .collect();
         count += 1;
         consume(count, &vector)?;

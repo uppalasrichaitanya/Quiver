@@ -61,8 +61,10 @@ fn read_f32_le(path: &Path) -> Vec<f32> {
         "file not a multiple of 4 bytes"
     );
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -73,8 +75,10 @@ fn read_u32_le(path: &Path) -> Vec<u32> {
         "file not a multiple of 4 bytes"
     );
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
