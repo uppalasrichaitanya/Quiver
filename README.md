@@ -28,7 +28,7 @@ The workspace includes an Axum server with insert, search, batch-search, metrics
 - HNSW graph topology is persisted as a snapshot on `flush`/`compact` and loaded on `open`, but vectors inserted after the last snapshot still require a rebuild on reopen; a hard kill leaves the snapshot stale (the server flushes on graceful shutdown).
 - The HNSW API is single-threaded. Mutation safety comes from Rust's `&mut self`; the server wraps the index in an `RwLock` (parallel reads, exclusive writes).
 - Filtered search is a single-pass filter-aware traversal, but cost still grows as selectivity shrinks: at SIFT1M/M=32/efc200/ef=100 the 50% case runs ~2124 QPS while the 1% case runs ~195 QPS (an ~11x gap, down from ~25x under the earlier naive post-filtering). Recall stays >= 0.9837 at 1%/10%/50% selectivity. Only `Eq` and `And` filters are implemented; `Or`/`In`/range are deferred, and metadata is immutable after insert.
-- SQ8 and IVF-PQ are batch-built indexes with CRC-protected `save`/`load` file snapshots; online inserts/recalibration and server/Python exposure of IVF-PQ are not implemented. IVF-PQ is L2-only and has no metadata/filtered search.
+- SQ8 and IVF-PQ are batch-built indexes with CRC-protected `save`/`load` snapshots, served read-only via `POST /sq8/search` / `POST /ivfpq/search` and `Sq8IndexPy` / `IvfPqIndexPy`; online inserts/recalibration are not implemented. IVF-PQ is L2-only and has no metadata/filtered search.
 - Benchmark evidence, including reproducible SIFT1M comparisons and scalar/SIMD Criterion results, is documented in `benchmarks/`. A sampling flamegraph remains unavailable after the documented `samply` install attempt.
 - The crates have not yet been released to crates.io or PyPI.
 
@@ -90,9 +90,11 @@ $env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "
 Axum was temporarily removed in an earlier commit because `C:\MinGW\bin\dlltool.exe` was selected and failed to create 64-bit import libraries with `Invalid bfd target`. That was a PATH/toolchain conflict, not an Axum or Tokio limitation. Axum is restored, and the server now opens an existing index on restart or creates one when the configured data path does not exist.
 
 The server exposes `POST /vectors` (optional `metadata`), `POST /search` and
-`POST /search/batch` (both with an optional `filter`), `DELETE /vectors/{id}`,
+`POST /search/batch` (both with an optional `filter`), `POST /sq8/search` and
+`POST /ivfpq/search` (pre-built quantized snapshots via `QUIVER_SQ8_PATH` /
+`QUIVER_IVFPQ_PATH`; L2-only, no filter), `DELETE /vectors/{id}`,
 `GET /metrics`, and `POST /shutdown`. A local native Python API is also available through
-[`quiver-py`](quiver-py/README.md).
+[`quiver-py`](quiver-py/README.md) (`Index` for HNSW, `Sq8IndexPy` / `IvfPqIndexPy` for quantized).
 
 ![Quiver semantic-search terminal demo](examples/semantic-search-demo.gif)
 

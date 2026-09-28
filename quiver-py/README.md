@@ -31,3 +31,21 @@ print(index.search([1.0, 0.0, 0.0], k=10, filter={"And": [
 
 Metadata values may be booleans, integers, floats, or strings. Vectors
 inserted without metadata never match a filter.
+
+Batch-built quantized indexes are also available. They are L2-only with no
+metadata, no deletes, and no online inserts — build in memory or load a
+snapshot saved earlier:
+
+```python
+from quiver_db import Sq8IndexPy, IvfPqIndexPy
+
+sq8 = Sq8IndexPy.build(vectors, metric="l2")
+sq8.save("index.qvsq")
+sq8 = Sq8IndexPy.load("index.qvsq")
+print(sq8.search([0.9, 0.1, 0.0], k=1))
+
+ivfpq = IvfPqIndexPy.build(vectors, nlist=1024, m=32, ksub=256)
+ivfpq.save("index.qvpq")
+ivfpq = IvfPqIndexPy.load("index.qvpq")
+print(ivfpq.search([0.9, 0.1, 0.0], k=10, nprobe=8, rerank_factor=16))
+```

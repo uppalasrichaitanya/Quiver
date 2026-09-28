@@ -9,6 +9,8 @@ use pyo3::{
 use quiver_core::{
     distance::Metric,
     index::hnsw::{HnswConfig, HnswIndex},
+    index::ivfpq::{IvfPqConfig, IvfPqIndex},
+    index::sq8::Sq8Index,
     metadata::{Filter, Metadata},
 };
 
@@ -161,6 +163,133 @@ impl Index {
     }
 }
 
+fn parse_metric(name: &str) -> PyResult<Metric> {
+    match name.to_ascii_lowercase().as_str() {
+        "l2" | "euclidean" => Ok(Metric::L2),
+        "dot" | "dotproduct" | "dot_product" | "ip" => Ok(Metric::DotProduct),
+        "cosine" | "cos" => Ok(Metric::Cosine),
+        _ => Err(py_error("metric must be one of 'l2', 'dot', 'cosine'")),
+    }
+}
+
+/// Batch-built SQ8 flat index: no deletes, no metadata. Built in memory,
+/// searchable directly, or persisted with `save`/`load`.
+#[pyclass]
+struct Sq8IndexPy {
+    inner: Sq8Index,
+}
+
+#[pymethods]
+impl Sq8IndexPy {
+    #[staticmethod]
+    #[pyo3(signature = (vectors, metric="l2"))]
+    fn build(vectors: Vec<Vec<f32>>, metric: &str) -> PyResult<Self> {
+        let metric = parse_metric(metric)?;
+        Ok(Self {
+            inner: Sq8Index::build(&vectors, metric).map_err(py_error)?,
+        })
+    }
+
+    #[staticmethod]
+    fn load(path: String) -> PyResult<Self> {
+        Ok(Self {
+            inner: Sq8Index::load(&path).map_err(py_error)?,
+        })
+    }
+
+    fn save(&self, path: String) -> PyResult<()> {
+        self.inner.save(&path).map_err(py_error)
+    }
+
+    #[pyo3(signature = (vector, k=10))]
+    fn search(&self, vector: Vec<f32>, k: usize) -> PyResult<Vec<(u64, f32)>> {
+        Ok(self
+            .inner
+            .search(&vector, k)
+            .map_err(py_error)?
+            .into_iter()
+            .map(|hit| (hit.vector_id, hit.distance))
+            .collect())
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+}
+
+/// Batch-built IVF-PQ index (L2-only, no metadata). Built in memory,
+/// searchable directly, or persisted with `save`/`load`.
+#[pyclass]
+struct IvfPqIndexPy {
+    inner: IvfPqIndex,
+}
+
+#[pymethods]
+impl IvfPqIndexPy {
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (vectors, nlist, m, ksub, kmeans_iters=8, training_size=65536, store_vectors=true, seed=0xC0FFEE))]
+    fn build(
+        vectors: Vec<Vec<f32>>,
+        nlist: usize,
+        m: usize,
+        ksub: usize,
+        kmeans_iters: usize,
+        training_size: usize,
+        store_vectors: bool,
+        seed: u64,
+    ) -> PyResult<Self> {
+        let mut config = IvfPqConfig::new(nlist, m, ksub);
+        config.kmeans_iters = kmeans_iters;
+        config.training_size = training_size;
+        config.store_vectors = store_vectors;
+        config.seed = seed;
+        Ok(Self {
+            inner: IvfPqIndex::build(&vectors, &config).map_err(py_error)?,
+        })
+    }
+
+    #[staticmethod]
+    fn load(path: String) -> PyResult<Self> {
+        Ok(Self {
+            inner: IvfPqIndex::load(&path).map_err(py_error)?,
+        })
+    }
+
+    fn save(&self, path: String) -> PyResult<()> {
+        self.inner.save(&path).map_err(py_error)
+    }
+
+    #[pyo3(signature = (vector, k=10, nprobe=8, rerank_factor=0))]
+    fn search(
+        &self,
+        vector: Vec<f32>,
+        k: usize,
+        nprobe: usize,
+        rerank_factor: usize,
+    ) -> PyResult<Vec<(u64, f32)>> {
+        Ok(self
+            .inner
+            .search(&vector, k, nprobe, rerank_factor)
+            .map_err(py_error)?
+            .into_iter()
+            .map(|hit| (hit.vector_id, hit.distance))
+            .collect())
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+}
+
 #[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -169,6 +298,8 @@ fn version() -> &'static str {
 #[pymodule]
 fn quiver_db(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Index>()?;
+    m.add_class::<Sq8IndexPy>()?;
+    m.add_class::<IvfPqIndexPy>()?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

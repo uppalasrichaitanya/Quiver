@@ -12,16 +12,22 @@ use axum::{
 use quiver_core::{
     distance::Metric,
     index::hnsw::{HnswConfig, HnswIndex},
+    index::ivfpq::IvfPqIndex,
+    index::sq8::Sq8Index,
     metadata::{Filter, Metadata},
 };
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
 type SharedIndex = Arc<RwLock<HnswIndex>>;
+type SharedSq8 = Arc<RwLock<Option<Sq8Index>>>;
+type SharedIvfPq = Arc<RwLock<Option<IvfPqIndex>>>;
 
 #[derive(Clone)]
 struct AppState {
     index: SharedIndex,
+    sq8: SharedSq8,
+    ivfpq: SharedIvfPq,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -60,12 +66,26 @@ struct SearchHit {
     id: u64,
     distance: f32,
 }
+#[derive(Deserialize)]
+struct Sq8SearchRequest {
+    vector: Vec<f32>,
+    k: usize,
+}
+#[derive(Deserialize)]
+struct IvfPqSearchRequest {
+    vector: Vec<f32>,
+    k: usize,
+    nprobe: Option<usize>,
+    rerank_factor: Option<usize>,
+}
 #[derive(Serialize)]
 struct MetricsResponse {
     len: usize,
     dimension: u32,
     metric: String,
     max_level: usize,
+    sq8_len: Option<usize>,
+    ivfpq_len: Option<usize>,
 }
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -121,6 +141,8 @@ async fn main() {
     };
     tracing::info!(address = %listener.local_addr().unwrap(), "Quiver server listening");
     let index = Arc::new(RwLock::new(index));
+    let sq8 = Arc::new(RwLock::new(load_sq8_snapshot()));
+    let ivfpq = Arc::new(RwLock::new(load_ivfpq_snapshot()));
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let app = Router::new()
         .route("/health", get(health))
@@ -128,10 +150,14 @@ async fn main() {
         .route("/vectors", post(insert))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
+        .route("/sq8/search", post(search_sq8))
+        .route("/ivfpq/search", post(search_ivfpq))
         .route("/vectors/{id}", delete(remove))
         .route("/shutdown", post(shutdown_handler))
         .with_state(AppState {
             index: Arc::clone(&index),
+            sq8: Arc::clone(&sq8),
+            ivfpq: Arc::clone(&ivfpq),
             shutdown: Arc::clone(&shutdown),
         });
     axum::serve(listener, app)
@@ -176,7 +202,48 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
         dimension: index.dimension(),
         metric: format!("{:?}", index.metric()),
         max_level: index.max_level(),
+        sq8_len: state.sq8.read().unwrap().as_ref().map(|s| s.len()),
+        ivfpq_len: state.ivfpq.read().unwrap().as_ref().map(|i| i.len()),
     })
+}
+
+/// Load an optional SQ8 snapshot. `QUIVER_SQ8_PATH` unset or missing means
+/// quantized search is disabled; a present-but-corrupt file is logged and
+/// also disables the endpoint rather than refusing to start the HNSW server.
+fn load_sq8_snapshot() -> Option<Sq8Index> {
+    let path = env::var("QUIVER_SQ8_PATH").ok()?;
+    if !std::path::Path::new(&path).exists() {
+        return None;
+    }
+    match Sq8Index::load(&path) {
+        Ok(index) => {
+            tracing::info!(path = %path, len = index.len(), "loaded SQ8 snapshot");
+            Some(index)
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "SQ8 snapshot invalid; endpoint disabled");
+            None
+        }
+    }
+}
+
+/// Load an optional IVF-PQ snapshot. Same unset/missing/corrupt semantics as
+/// [`load_sq8_snapshot`].
+fn load_ivfpq_snapshot() -> Option<IvfPqIndex> {
+    let path = env::var("QUIVER_IVFPQ_PATH").ok()?;
+    if !std::path::Path::new(&path).exists() {
+        return None;
+    }
+    match IvfPqIndex::load(&path) {
+        Ok(index) => {
+            tracing::info!(path = %path, len = index.len(), "loaded IVF-PQ snapshot");
+            Some(index)
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "IVF-PQ snapshot invalid; endpoint disabled");
+            None
+        }
+    }
 }
 
 async fn insert(
@@ -279,6 +346,81 @@ async fn remove(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     state.index.write().unwrap().delete(id).map_err(api_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn quantized_unavailable(name: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: format!("{name} snapshot not loaded; set QUIVER_{name}_PATH"),
+        }),
+    )
+}
+
+/// Search a pre-built SQ8 snapshot. Filtered search is not supported on the
+/// quantized path: SQ8 stores no metadata, so use `/search` with a filter.
+async fn search_sq8(
+    State(state): State<AppState>,
+    Json(request): Json<Sq8SearchRequest>,
+) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
+    if request.k < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "k must be at least 1".into(),
+            }),
+        ));
+    }
+    let guard = state.sq8.read().unwrap();
+    let index = guard.as_ref().ok_or_else(|| quantized_unavailable("SQ8"))?;
+    let hits = index
+        .search(&request.vector, request.k)
+        .map_err(api_error)?;
+    Ok(Json(
+        hits.into_iter()
+            .map(|hit| SearchHit {
+                id: hit.vector_id,
+                distance: hit.distance,
+            })
+            .collect(),
+    ))
+}
+
+/// Search a pre-built IVF-PQ snapshot. L2-only with no metadata, so `nprobe`
+/// (default 8) and `rerank_factor` (default 0, exact-L2 rerank off) are the
+/// only quality knobs.
+async fn search_ivfpq(
+    State(state): State<AppState>,
+    Json(request): Json<IvfPqSearchRequest>,
+) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
+    if request.k < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "k must be at least 1".into(),
+            }),
+        ));
+    }
+    let guard = state.ivfpq.read().unwrap();
+    let index = guard
+        .as_ref()
+        .ok_or_else(|| quantized_unavailable("IVFPQ"))?;
+    let hits = index
+        .search(
+            &request.vector,
+            request.k,
+            request.nprobe.unwrap_or(8),
+            request.rerank_factor.unwrap_or(0),
+        )
+        .map_err(api_error)?;
+    Ok(Json(
+        hits.into_iter()
+            .map(|hit| SearchHit {
+                id: hit.vector_id,
+                distance: hit.distance,
+            })
+            .collect(),
+    ))
 }
 
 /// Map a core error to an HTTP status: client mistakes (bad dimension, empty
