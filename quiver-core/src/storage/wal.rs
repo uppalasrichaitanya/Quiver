@@ -32,12 +32,32 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{QuiverError, Result};
 use crate::metadata::Metadata;
+
+const CHECKPOINT_PREPARED: &[u8] = b"prepared";
+const CHECKPOINT_OLD_MOVED: &[u8] = b"old_moved";
+const CHECKPOINT_INSTALLED: &[u8] = b"installed";
+
+struct CheckpointPaths {
+    temp: PathBuf,
+    backup: PathBuf,
+    marker: PathBuf,
+}
+
+impl CheckpointPaths {
+    fn new(path: &Path) -> Self {
+        Self {
+            temp: sidecar_path(path, ".checkpoint.tmp"),
+            backup: sidecar_path(path, ".checkpoint.bak"),
+            marker: sidecar_path(path, ".checkpoint.marker"),
+        }
+    }
+}
 
 /// The type of operation recorded in a WAL entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,15 +100,16 @@ pub struct Wal {
     /// Path to the WAL file.
     path: PathBuf,
     /// Buffered writer for appending entries.
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
 }
 
 impl Wal {
     /// Open or create a WAL file at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        Self::recover_checkpoint(&path)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let writer = BufWriter::new(file);
+        let writer = Some(BufWriter::new(file));
         Ok(Self { path, writer })
     }
 
@@ -119,8 +140,12 @@ impl Wal {
 
     /// Flush the WAL to disk (fsync).
     pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| QuiverError::Io(io::Error::other("WAL writer is closed")))?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
         Ok(())
     }
 
@@ -225,61 +250,171 @@ impl Wal {
 
     /// Clear the WAL (e.g., after a successful checkpoint/flush of the main store).
     pub fn clear(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush()?;
+        }
+        drop(self.writer.take());
         let file = OpenOptions::new()
             .write(true)
             .truncate(true)
+            .create(true)
             .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer = Some(BufWriter::new(file));
         Ok(())
     }
 
-    /// Truncate this WAL in place and rewrite it with exactly the given
-    /// entries (in order), fsynced. Used by `VectorStore::flush` to checkpoint
-    /// the log once the data file is durable: plain Insert entries become
-    /// replay-skips, while Delete and InsertMeta entries are retained (deletes
-    /// have no other durable home, and InsertMeta keeps the WAL as the
-    /// metadata fallback if the snapshot is later corrupted).
+    /// Replace this WAL with a durable copy containing exactly the given
+    /// entries. Used by `VectorStore::flush` to checkpoint the log once the
+    /// data file is durable.
     pub fn checkpoint(&mut self, keep: &[&WalEntry]) -> Result<()> {
-        // Rebuild the writer on a truncate handle so the file starts at
-        // offset 0. A truncate through a separate handle does not reset the
-        // existing append-mode handle's end-of-file position on Windows, so
-        // the next append would land at the old offset (sparse gap + orphaned
-        // bytes) instead of overwriting the log.
-        self.clear()?;
-        for entry in keep {
-            let body = match entry.op {
-                WalOp::Delete => Self::serialize_delete(entry.vector_id),
-                WalOp::InsertMeta => {
-                    let metadata = entry
-                        .metadata
-                        .as_ref()
-                        .expect("InsertMeta entry carries metadata");
-                    let data = entry
-                        .vector_data
-                        .as_ref()
-                        .expect("InsertMeta entry carries vector data");
-                    Self::serialize_insert_meta(entry.vector_id, metadata, data)
-                }
-                WalOp::Insert => {
-                    return Err(QuiverError::InvalidFormat(
-                        "WAL checkpoint must not retain Insert entries".to_owned(),
-                    ));
-                }
-            };
-            let frame = Self::entry_frame(&body)?;
-            self.writer.write_all(&frame)?;
-        }
         self.flush()?;
-        Ok(())
+        let path = self.path.clone();
+        drop(self.writer.take());
+
+        let checkpoint_result = Self::checkpoint_path(&path, keep);
+        let reopen_result = Self::open(&path);
+        match (checkpoint_result, reopen_result) {
+            (Ok(()), Ok(mut reopened)) => {
+                self.writer = reopened.writer.take();
+                Ok(())
+            }
+            (Err(error), Ok(mut reopened)) => {
+                self.writer = reopened.writer.take();
+                Err(error)
+            }
+            (_, Err(error)) => Err(error),
+        }
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
 
     fn write_entry(&mut self, body: &[u8]) -> Result<()> {
         let frame = Self::entry_frame(body)?;
-        self.writer.write_all(&frame)?;
+        self.writer
+            .as_mut()
+            .ok_or_else(|| QuiverError::Io(io::Error::other("WAL writer is closed")))?
+            .write_all(&frame)?;
         Ok(())
+    }
+
+    fn checkpoint_path(path: &Path, keep: &[&WalEntry]) -> Result<()> {
+        Self::recover_checkpoint(path)?;
+        let paths = CheckpointPaths::new(path);
+        let result = (|| -> Result<()> {
+            Self::write_checkpoint_file(&paths.temp, keep)?;
+            write_marker(&paths.marker, CHECKPOINT_PREPARED)?;
+            checkpoint_failpoint("replacement_durable");
+
+            fs::rename(path, &paths.backup)?;
+            sync_parent(path)?;
+            write_marker(&paths.marker, CHECKPOINT_OLD_MOVED)?;
+            checkpoint_failpoint("old_wal_moved");
+
+            fs::rename(&paths.temp, path)?;
+            sync_parent(path)?;
+            write_marker(&paths.marker, CHECKPOINT_INSTALLED)?;
+            checkpoint_failpoint("new_wal_installed");
+
+            remove_file_if_exists(&paths.backup)?;
+            remove_file_if_exists(&paths.temp)?;
+            remove_file_if_exists(&paths.marker)?;
+            sync_parent(path)?;
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            Self::recover_checkpoint(path)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn write_checkpoint_file(path: &Path, keep: &[&WalEntry]) -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(path)?;
+        let mut writer = BufWriter::new(file);
+        for entry in keep {
+            let body = Self::checkpoint_entry_body(entry)?;
+            let frame = Self::entry_frame(&body)?;
+            writer.write_all(&frame)?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        sync_parent(path)
+    }
+
+    fn checkpoint_entry_body(entry: &WalEntry) -> Result<Vec<u8>> {
+        match entry.op {
+            WalOp::Delete => Ok(Self::serialize_delete(entry.vector_id)),
+            WalOp::InsertMeta => {
+                let metadata = entry.metadata.as_ref().ok_or_else(|| {
+                    QuiverError::InvalidFormat(
+                        "WAL InsertMeta entry is missing metadata".to_owned(),
+                    )
+                })?;
+                let data = entry.vector_data.as_ref().ok_or_else(|| {
+                    QuiverError::InvalidFormat(
+                        "WAL InsertMeta entry is missing vector data".to_owned(),
+                    )
+                })?;
+                Ok(Self::serialize_insert_meta(entry.vector_id, metadata, data))
+            }
+            WalOp::Insert => Err(QuiverError::InvalidFormat(
+                "WAL checkpoint must not retain Insert entries".to_owned(),
+            )),
+        }
+    }
+
+    fn recover_checkpoint(path: &Path) -> Result<()> {
+        let paths = CheckpointPaths::new(path);
+        if path.exists() {
+            if !paths.temp.exists() && !paths.backup.exists() && !paths.marker.exists() {
+                return Ok(());
+            }
+            remove_file_if_exists(&paths.temp)?;
+            remove_file_if_exists(&paths.backup)?;
+            remove_file_if_exists(&paths.marker)?;
+            sync_parent(path)?;
+            return Ok(());
+        }
+
+        if Self::is_complete_wal(&paths.temp)? {
+            fs::rename(&paths.temp, path)?;
+            sync_parent(path)?;
+            remove_file_if_exists(&paths.backup)?;
+            remove_file_if_exists(&paths.marker)?;
+            sync_parent(path)?;
+            return Ok(());
+        }
+
+        if paths.backup.exists() {
+            fs::rename(&paths.backup, path)?;
+            sync_parent(path)?;
+            remove_file_if_exists(&paths.temp)?;
+            remove_file_if_exists(&paths.marker)?;
+            sync_parent(path)?;
+            return Ok(());
+        }
+
+        if !paths.marker.exists() {
+            return Ok(());
+        }
+
+        Err(QuiverError::InvalidFormat(
+            "Unable to recover interrupted WAL checkpoint".to_owned(),
+        ))
+    }
+
+    fn is_complete_wal(path: &Path) -> Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let (_, valid_up_to) = Self::read_entries(path)?;
+        Ok(valid_up_to == fs::metadata(path)?.len())
     }
 
     /// Serialize one entry frame: length prefix + body + CRC32 checksum of the
@@ -465,6 +600,64 @@ impl Wal {
         }
     }
 }
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_marker(path: &Path, phase: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(phase)?;
+    file.sync_all()?;
+    sync_parent(path)
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn checkpoint_failpoint(name: &str) {
+    if std::env::var("QUIVER_WAL_CHECKPOINT_FAILPOINT").as_deref() != Ok(name) {
+        return;
+    }
+
+    if let Ok(signal_path) = std::env::var("QUIVER_WAL_CHECKPOINT_SIGNAL") {
+        fs::write(signal_path, name).unwrap();
+    }
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(not(test))]
+fn checkpoint_failpoint(_name: &str) {}
 
 #[cfg(test)]
 mod tests {

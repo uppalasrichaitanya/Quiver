@@ -551,17 +551,10 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Rewrite the WAL in place, dropping the entries it is retaining.
-    ///
-    /// Safe to run after [`Self::flush`] has made the data file (and, when any
-    /// vector has metadata, the metadata snapshot) durable: plain Insert
-    /// entries are skipped by replay because their IDs are at or below the
-    /// persisted `max_vector_id`, so they are dropped. Delete entries have no
-    /// other durable home, and InsertMeta entries keep the WAL as the metadata
-    /// fallback if the snapshot is later corrupted — both are retained. The
-    /// truncate-and-rewrite happens on the existing handle; a crash in the
-    /// microsecond window loses at most the retained ops logged since the
-    /// previous checkpoint — never vector data.
+    /// Replace the WAL with a durable copy containing only the entries that
+    /// still need replay. Plain Insert entries are skipped by replay because
+    /// their IDs are at or below the persisted `max_vector_id`, while Delete
+    /// and InsertMeta entries are retained.
     fn checkpoint_wal(&mut self) -> Result<()> {
         let (entries, _) = Wal::read_entries(&self.wal_path)?;
         let keep: Vec<&WalEntry> = entries
@@ -1485,6 +1478,18 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_kill_child() {
+        if std::env::var("QUIVER_WAL_CHECKPOINT_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+
+        let data_path = PathBuf::from(std::env::var("QUIVER_WAL_CHECKPOINT_DATA").unwrap());
+        let wal_path = PathBuf::from(std::env::var("QUIVER_WAL_CHECKPOINT_WAL").unwrap());
+        let mut store = VectorStore::open(data_path, wal_path).unwrap();
+        store.flush().unwrap();
+    }
+
+    #[test]
     fn compaction_kill_child() {
         if std::env::var("QUIVER_COMPACTION_CHILD").as_deref() != Ok("1") {
             return;
@@ -1545,6 +1550,60 @@ mod tests {
         assert_eq!(store.get_vector(0).unwrap(), &[1.0, 1.0]);
         assert_eq!(store.get_vector(1).unwrap(), &[3.0, 3.0]);
         assert_eq!(store.wal_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_kill_during_wal_checkpoint_recovers_delete() {
+        for phase in ["replacement_durable", "old_wal_moved", "new_wal_installed"] {
+            let dir = TempDir::new().unwrap();
+            let data_path = dir.path().join("checkpoint_kill.qvdb");
+            let wal_path = dir.path().join("checkpoint_kill.wal");
+            let signal_path = dir.path().join("checkpoint.signal");
+            let deleted_id;
+            let live_id;
+
+            {
+                let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+                store.insert(&[1.0, 1.0]).unwrap();
+                deleted_id = store.insert(&[2.0, 2.0]).unwrap();
+                live_id = store.insert(&[3.0, 3.0]).unwrap();
+                store.flush().unwrap();
+                store.delete(deleted_id).unwrap();
+            }
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("storage::vecstore::tests::checkpoint_kill_child")
+                .arg("--nocapture")
+                .env("QUIVER_WAL_CHECKPOINT_CHILD", "1")
+                .env("QUIVER_WAL_CHECKPOINT_DATA", &data_path)
+                .env("QUIVER_WAL_CHECKPOINT_WAL", &wal_path)
+                .env("QUIVER_WAL_CHECKPOINT_FAILPOINT", phase)
+                .env("QUIVER_WAL_CHECKPOINT_SIGNAL", &signal_path)
+                .spawn()
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !signal_path.exists() && Instant::now() < deadline {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("checkpoint child exited before failpoint: {status}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                signal_path.exists(),
+                "checkpoint failpoint was not reached: {phase}"
+            );
+
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let store = VectorStore::open(&data_path, &wal_path).unwrap();
+            assert_eq!(store.len(), 3);
+            assert!(store.is_deleted(deleted_id));
+            assert!(!store.is_deleted(live_id));
+            assert_eq!(store.get_vector(1).unwrap(), &[2.0, 2.0]);
+        }
     }
 
     #[test]
