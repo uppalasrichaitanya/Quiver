@@ -46,7 +46,7 @@ impl Sq8Index {
             });
         }
         if query.iter().any(|value| !value.is_finite()) {
-            return Err(QuiverError::InvalidFormat(
+            return Err(QuiverError::InvalidInput(
                 "SQ8 queries must contain only finite values".to_owned(),
             ));
         }

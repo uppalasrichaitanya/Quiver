@@ -309,6 +309,9 @@ impl VectorStore {
             });
         }
 
+        if metadata.is_some() {
+            self.ensure_metadata_capable()?;
+        }
         let vector_id = self.header.max_vector_id + 1;
 
         // Log to WAL first (durability guarantee)
@@ -377,6 +380,9 @@ impl VectorStore {
         }
         if batch.is_empty() {
             return Ok(Vec::new());
+        }
+        if metadata.is_some_and(|slice| slice.iter().any(Option::is_some)) {
+            self.ensure_metadata_capable()?;
         }
 
         let base = self.header.max_vector_id;
@@ -461,6 +467,22 @@ impl VectorStore {
         wal.flush()?;
         if let Some(previous) = self.metadata[slot].take() {
             self.deindex_metadata(vector_id, &previous);
+        }
+        Ok(())
+    }
+
+    /// Reject metadata on legacy v1 stores.
+    ///
+    /// Attaching metadata bumps the header to the current version, but v1
+    /// records carry no vector-ID prefix: relabeling the file would make every
+    /// existing record parse at the wrong offset. `compact` migrates a legacy
+    /// store to the current record layout, after which metadata is allowed.
+    fn ensure_metadata_capable(&self) -> Result<()> {
+        if self.header.version == LEGACY_FORMAT_VERSION {
+            return Err(QuiverError::InvalidInput(
+                "legacy v1 stores cannot hold metadata; run compact() to migrate the store first"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -702,13 +724,30 @@ impl VectorStore {
     /// Replace the WAL with a durable copy containing only the entries that
     /// still need replay. Plain Insert entries are skipped by replay because
     /// their IDs are at or below the persisted `max_vector_id`, while Delete,
-    /// InsertMeta, UpdateMeta, and ClearMeta entries are retained.
+    /// UpdateMeta, and ClearMeta entries are retained.
+    ///
+    /// InsertMeta entries keep their metadata (the snapshot-corruption
+    /// fallback) but not their vector payload, which the durable data file
+    /// already holds: each is rewritten as an equivalent UpdateMeta. Keeping
+    /// the payload would grow the WAL by a full vector per metadata insert
+    /// across every flush. Log order is preserved, so replaying the rewritten
+    /// entry followed by later updates/clears yields the same final state.
     fn checkpoint_wal(&mut self) -> Result<()> {
         let (entries, _) = Wal::read_entries(&self.wal_path)?;
-        let keep: Vec<&WalEntry> = entries
-            .iter()
+        let rewritten: Vec<WalEntry> = entries
+            .into_iter()
             .filter(|entry| entry.op != WalOp::Insert)
+            .map(|entry| match entry.op {
+                WalOp::InsertMeta if entry.vector_id <= self.header.max_vector_id => WalEntry {
+                    op: WalOp::UpdateMeta,
+                    vector_id: entry.vector_id,
+                    vector_data: None,
+                    metadata: entry.metadata,
+                },
+                _ => entry,
+            })
             .collect();
+        let keep: Vec<&WalEntry> = rewritten.iter().collect();
         let wal = self.wal.as_mut().expect("vector store WAL is open");
         wal.checkpoint(&keep)
     }
@@ -1076,7 +1115,12 @@ impl VectorStore {
         // Once any metadata exists, the store must identify as v3 so
         // pre-metadata binaries (which cannot see the `.meta` snapshot or
         // replay `InsertMeta` entries) refuse to open it.
-        if metadata.is_some() && self.header.version < FORMAT_VERSION {
+        // Never relabel a legacy v1 file: its records lack the ID prefix, so
+        // the new version would misparse them (see `ensure_metadata_capable`).
+        if metadata.is_some()
+            && self.header.version != LEGACY_FORMAT_VERSION
+            && self.header.version < FORMAT_VERSION
+        {
             self.header.version = FORMAT_VERSION;
         }
         self.metadata.push(metadata);
@@ -2138,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_insert_into_v2_store_bumps_version_to_3() {
+    fn test_metadata_insert_into_v2_store_bumps_version_to_current() {
         let dir = TempDir::new().unwrap();
         let data_path = dir.path().join("v2_upgrade.qvdb");
         let wal_path = dir.path().join("v2_upgrade.wal");
@@ -2167,10 +2211,137 @@ mod tests {
         }
 
         let store = VectorStore::open(&data_path, &wal_path).unwrap();
-        assert_eq!(fs::read(&data_path).unwrap()[4], 3);
+        assert_eq!(
+            fs::read(&data_path).unwrap()[4],
+            crate::storage::header::FORMAT_VERSION
+        );
         assert_eq!(store.len(), 2);
         assert_eq!(store.metadata(0), None);
         assert_eq!(store.metadata(1), Some(&sample_metadata()));
+    }
+
+    #[test]
+    fn test_metadata_insert_into_legacy_store_is_rejected_not_corrupting() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("legacy_meta.qvdb");
+        let wal_path = dir.path().join("legacy_meta.wal");
+
+        let mut header = FileHeader::new(2, Metric::L2);
+        header.version = LEGACY_FORMAT_VERSION;
+        header.vector_count = 2;
+        header.max_vector_id = 2;
+        {
+            let mut file = File::create(&data_path).unwrap();
+            file.write_all(&header.to_bytes()).unwrap();
+            for value in [1.0_f32, 2.0, 3.0, 4.0] {
+                file.write_all(&value.to_le_bytes()).unwrap();
+            }
+            file.sync_all().unwrap();
+            File::create(&wal_path).unwrap().sync_all().unwrap();
+        }
+
+        let mut store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert!(
+            store
+                .insert_with_metadata(&[5.0, 6.0], sample_metadata())
+                .is_err()
+        );
+        assert!(
+            store
+                .insert_batch_with_metadata(&[&[5.0, 6.0]], &[Some(sample_metadata())])
+                .is_err()
+        );
+        // Nothing was relabeled or written: existing records still parse.
+        assert_eq!(store.header.version, LEGACY_FORMAT_VERSION);
+        assert_eq!(store.get_vector(0).unwrap(), &[1.0, 2.0]);
+        assert_eq!(store.get_vector(1).unwrap(), &[3.0, 4.0]);
+        store.flush().unwrap();
+        drop(store);
+
+        // After compaction migrates the layout, metadata is accepted and
+        // survives a reopen alongside the original vectors.
+        let mut store = VectorStore::open(&data_path, &wal_path).unwrap();
+        store.compact().unwrap();
+        let id = store
+            .insert_with_metadata(&[5.0, 6.0], sample_metadata())
+            .unwrap();
+        store.flush().unwrap();
+        drop(store);
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get_vector(0).unwrap(), &[1.0, 2.0]);
+        assert_eq!(store.get_vector(1).unwrap(), &[3.0, 4.0]);
+        assert_eq!(store.get_vector(2).unwrap(), &[5.0, 6.0]);
+        assert_eq!(store.vector_id(2).unwrap(), id);
+        assert_eq!(store.metadata(2), Some(&sample_metadata()));
+    }
+
+    #[test]
+    fn test_flush_drops_insert_meta_vector_payloads_from_wal() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("meta_wal.qvdb");
+        let wal_path = dir.path().join("meta_wal.wal");
+        let dimension = 64;
+        let mut sizes = Vec::new();
+        {
+            let mut store =
+                VectorStore::create(&data_path, &wal_path, dimension, Metric::L2).unwrap();
+            for round in 0..3 {
+                for i in 0..200 {
+                    let mut vector = vec![0.5f32; dimension as usize];
+                    vector[0] = (round * 200 + i) as f32;
+                    store
+                        .insert_with_metadata(&vector, sample_metadata())
+                        .unwrap();
+                }
+                store.flush().unwrap();
+                sizes.push(store.wal_len().unwrap());
+            }
+            // Updates after the rewrite must still win on replay.
+            store.update_metadata(1, Metadata::new()).unwrap();
+        }
+        // 600 retained vectors would be >= 600 * 256 bytes of payload alone.
+        assert!(
+            sizes[2] < 600 * 256,
+            "WAL still retains vector payloads: {sizes:?}"
+        );
+
+        // With the snapshot gone, replay of the rewritten entries alone must
+        // restore every vector's metadata, including the later update.
+        fs::remove_file(sidecar_path(&data_path, ".meta")).unwrap();
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.len(), 600);
+        assert_eq!(store.metadata(0), Some(&Metadata::new()));
+        for slot in 1..600 {
+            assert_eq!(store.metadata(slot), Some(&sample_metadata()));
+        }
+    }
+
+    #[test]
+    fn test_open_rejects_torn_v4_header() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("torn_header.qvdb");
+        let wal_path = dir.path().join("torn_header.wal");
+
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            store.insert(&[1.0, 2.0]).unwrap();
+            store.flush().unwrap();
+        }
+
+        // Flip a count byte in the persisted header, simulating a torn flush.
+        {
+            let mut bytes = fs::read(&data_path).unwrap();
+            assert_eq!(bytes[4], crate::storage::header::FORMAT_VERSION);
+            bytes[12] ^= 0xFF;
+            fs::write(&data_path, bytes).unwrap();
+        }
+
+        let result = VectorStore::open(&data_path, &wal_path);
+        assert!(
+            result.is_err(),
+            "torn header must fail loudly instead of shrinking the store"
+        );
     }
 
     #[test]

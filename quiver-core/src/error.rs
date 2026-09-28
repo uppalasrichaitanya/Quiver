@@ -23,6 +23,11 @@ pub enum QuiverError {
         actual: u32,
     },
 
+    /// Caller-supplied input was rejected (e.g. non-finite vector components,
+    /// or metadata on a store whose format cannot hold it).
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     /// A dimension mismatch was detected (e.g., inserting a 128-d vector into a 256-d index).
     #[error("Dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: u32, actual: u32 },

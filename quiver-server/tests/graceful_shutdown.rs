@@ -137,3 +137,62 @@ fn graceful_shutdown_flushes_snapshot_and_reopen_skips_rebuild() {
         "second run must not rebuild, got log: {log}"
     );
 }
+
+#[test]
+fn auto_flush_bounds_snapshot_staleness_after_hard_kill() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("server.qvdb");
+    let wal = directory.path().join("server.wal");
+    let address = unused_address();
+    let first_log = directory.path().join("first.log");
+    let second_log = directory.path().join("second.log");
+
+    // One-second auto-flush: the snapshot must appear with no shutdown.
+    let log = fs::File::create(&first_log).unwrap();
+    let first = ServerProcess(
+        Command::new(env!("CARGO_BIN_EXE_quiver-server"))
+            .env("QUIVER_DATA_PATH", &data)
+            .env("QUIVER_WAL_PATH", &wal)
+            .env("QUIVER_DIMENSION", "3")
+            .env("QUIVER_BIND", address.to_string())
+            .env("QUIVER_FLUSH_INTERVAL_SECS", "1")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until_ready(address);
+    let (status, body) = request(address, "POST", "/vectors", r#"{"vector":[1.0,0.0,0.0]}"#);
+    assert_eq!(status, 201, "insert response: {body}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !graph_snapshot_path(&data).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "auto-flush must write the graph snapshot without a shutdown"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // Hard kill (Drop), never graceful: the reopen must still find the
+    // auto-flushed snapshot instead of rebuilding.
+    drop(first);
+    // Rebinding needs the old socket released.
+    thread::sleep(Duration::from_millis(500));
+    let second = start_server(&data, &wal, address, &second_log);
+    wait_until_ready(address);
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":1,"ef_search":10}"#,
+    );
+    assert_eq!(status, 200, "search response: {body}");
+    drop(second);
+
+    let log = fs::read_to_string(&second_log).unwrap();
+    assert!(
+        log.contains("Loaded HNSW graph topology from snapshot"),
+        "reopen after hard kill should load the auto-flushed snapshot, got log: {log}"
+    );
+}

@@ -6,13 +6,15 @@
 //! Offset  Size  Field
 //! ------  ----  -----
 //! 0       4     Magic bytes: b"QVDB"
-//! 4       1     Format version (currently 3)
+//! 4       1     Format version (currently 4)
 //! 5       1     Metric type (0 = L2, 1 = DotProduct, 2 = Cosine)
 //! 6       2     Reserved (padding, zeroed)
 //! 8       4     Vector dimension (u32, little-endian)
 //! 12      8     Vector count (u64, little-endian)
 //! 20      8     Max vector ID assigned so far (u64, little-endian)
-//! 28      36    Reserved for future use (zeroed)
+//! 28      32    Reserved for future use (zeroed)
+//! 60      4     Header CRC32 (CRC32 of bytes 0..60, little-endian; v4+ only,
+//!               zeroed in older versions)
 //! ------  ----
 //! 64      Total header size
 //! ```
@@ -24,6 +26,15 @@
 //! vectors may carry metadata (persisted out-of-band in the WAL and a `.meta`
 //! snapshot, never inline in the fixed-size records). Binaries predating
 //! metadata reject version 3 via the version check below.
+//!
+//! Version 4 is byte-identical to version 3 except bytes 60..64 carry a CRC32
+//! of the first 60 bytes. A torn header write (e.g. power loss mid-flush)
+//! previously shrank `vector_count` silently, after which the next insert
+//! overwrote the "lost" tail; v4 turns that into a loud open-time error.
+//! Opening never upgrades a store, so old binaries can still read v1/v2/v3
+//! files. New stores and compaction output are v4, and attaching metadata to
+//! a v2/v3 store upgrades it to v4 (metadata-unaware binaries must refuse
+//! it). Legacy v1 stores reject metadata until `compact` migrates them.
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -37,9 +48,16 @@ pub const MAGIC: &[u8; 4] = b"QVDB";
 /// Legacy format with raw f32 records and implicit `slot + 1` vector IDs.
 pub const LEGACY_FORMAT_VERSION: u8 = 1;
 
-/// Current format: explicit u64 vector ID at the start of each record, plus
-/// (since version 3) optional per-vector metadata stored out-of-band.
-pub const FORMAT_VERSION: u8 = 3;
+/// Current format: explicit u64 vector ID at the start of each record,
+/// optional per-vector metadata stored out-of-band (since version 3), and a
+/// CRC32 of the first 60 header bytes at offset 60 (since version 4).
+pub const FORMAT_VERSION: u8 = 4;
+
+/// First version carrying a header CRC32.
+pub const CRC_FORMAT_VERSION: u8 = 4;
+
+/// Offset of the CRC32 within the header.
+pub const HEADER_CRC_OFFSET: usize = 60;
 
 /// Total size of the file header in bytes.
 pub const HEADER_SIZE: usize = 64;
@@ -81,9 +99,17 @@ impl FileHeader {
         buf.write_u32::<LittleEndian>(self.dimension).unwrap();
         buf.write_u64::<LittleEndian>(self.vector_count).unwrap();
         buf.write_u64::<LittleEndian>(self.max_vector_id).unwrap();
-        // Pad the rest to reach HEADER_SIZE
-        let remaining = HEADER_SIZE - buf.len();
-        buf.write_all(&vec![0u8; remaining]).unwrap();
+        // Reserved bytes 28..60 stay zeroed; bytes 60..64 carry the CRC32 of
+        // bytes 0..60 for v4+ headers, zeros for older versions.
+        let reserved = HEADER_CRC_OFFSET - buf.len();
+        buf.write_all(&vec![0u8; reserved]).unwrap();
+        debug_assert_eq!(buf.len(), HEADER_CRC_OFFSET);
+        if self.version >= CRC_FORMAT_VERSION {
+            let crc = crc32fast::hash(&buf);
+            buf.write_u32::<LittleEndian>(crc).unwrap();
+        } else {
+            buf.write_all(&[0u8; 4]).unwrap();
+        }
         debug_assert_eq!(buf.len(), HEADER_SIZE);
         buf
     }
@@ -143,6 +169,20 @@ impl FileHeader {
 
         // Read max vector ID
         let max_vector_id = cursor.read_u64::<LittleEndian>()?;
+
+        if version >= CRC_FORMAT_VERSION {
+            let stored = u32::from_le_bytes([
+                data[HEADER_CRC_OFFSET],
+                data[HEADER_CRC_OFFSET + 1],
+                data[HEADER_CRC_OFFSET + 2],
+                data[HEADER_CRC_OFFSET + 3],
+            ]);
+            if crc32fast::hash(&data[..HEADER_CRC_OFFSET]) != stored {
+                return Err(QuiverError::InvalidFormat(
+                    "Header checksum mismatch: the header is torn or corrupt".to_string(),
+                ));
+            }
+        }
 
         Ok(Self {
             version,
@@ -221,9 +261,9 @@ mod tests {
     }
 
     #[test]
-    fn test_new_headers_are_version_3() {
-        assert_eq!(FORMAT_VERSION, 3);
-        assert_eq!(FileHeader::new(128, Metric::L2).version, 3);
+    fn test_new_headers_are_version_4() {
+        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(FileHeader::new(128, Metric::L2).version, 4);
     }
 
     #[test]
@@ -244,5 +284,35 @@ mod tests {
         assert_eq!(HEADER_SIZE, 64);
         let bytes = FileHeader::new(128, Metric::L2).to_bytes();
         assert_eq!(bytes.len(), 64);
+    }
+
+    #[test]
+    fn test_v4_header_carries_crc() {
+        let bytes = FileHeader::new(128, Metric::L2).to_bytes();
+        assert_eq!(bytes[4], 4);
+        let stored = u32::from_le_bytes([bytes[60], bytes[61], bytes[62], bytes[63]]);
+        assert_eq!(stored, crc32fast::hash(&bytes[..60]));
+    }
+
+    #[test]
+    fn test_v4_torn_header_is_rejected() {
+        let mut bytes = FileHeader::new(128, Metric::L2).to_bytes();
+        // Simulate a torn count write: flip a count byte, CRC now stale.
+        bytes[12] ^= 0xFF;
+        assert!(FileHeader::from_bytes(&bytes).is_err());
+        // Corrupting the CRC itself is equally loud.
+        let mut bytes = FileHeader::new(128, Metric::L2).to_bytes();
+        bytes[63] ^= 0xFF;
+        assert!(FileHeader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_v3_header_has_no_crc() {
+        // Pre-CRC stores keep zeroed tail bytes and parse without a check.
+        let mut header = FileHeader::new(128, Metric::L2);
+        header.version = 3;
+        let bytes = header.to_bytes();
+        assert_eq!(&bytes[60..64], &[0, 0, 0, 0]);
+        assert!(FileHeader::from_bytes(&bytes).is_ok());
     }
 }

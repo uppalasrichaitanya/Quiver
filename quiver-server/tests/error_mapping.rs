@@ -96,6 +96,42 @@ fn test_error_mapping_and_validation() {
         "non-finite insert should be a client error, got {status}: {body}"
     );
 
+    // 1e39 is a finite f64 but overflows f32 to infinity after parsing: the
+    // core rejects it, and that rejection is still a client error (was 500).
+    let (status, body) = request(address, "POST", "/vectors", r#"{"vector":[1e39,0.0,0.0]}"#);
+    assert_eq!(status, 400, "f32-overflow insert response: {body}");
+
+    // Absurd k / ef_search are rejected up front. A huge k on the filtered
+    // fast path used to size a ~24 PB allocation and abort the process.
+    let (status, body) = request(
+        address,
+        "POST",
+        "/vectors",
+        r#"{"vector":[1.0,0.0,0.0],"metadata":{"cat":1}}"#,
+    );
+    assert_eq!(status, 201, "metadata insert response: {body}");
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":1000000000000000,"filter":{"Eq":{"key":"cat","value":1}}}"#,
+    );
+    assert_eq!(status, 400, "huge-k response: {body}");
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":1,"ef_search":1000000000}"#,
+    );
+    assert_eq!(status, 400, "huge-ef response: {body}");
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search/batch",
+        r#"{"queries":[{"vector":[1.0,0.0,0.0],"k":1},{"vector":[1.0,0.0,0.0],"k":100000}]}"#,
+    );
+    assert_eq!(status, 400, "huge-k batch response: {body}");
+
     // Deleting an unknown ID is 404, and a valid delete is 204.
     let (status, body) = request(address, "DELETE", "/vectors/999", "");
     assert_eq!(status, 404, "delete-unknown response: {body}");

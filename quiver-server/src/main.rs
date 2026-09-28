@@ -1,6 +1,7 @@
 use std::{
     env,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use axum::{
@@ -96,6 +97,39 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Largest `k` a single query may request. Bounds per-request work and
+/// memory; the core also clamps `k`, but a public endpoint should reject
+/// absurd values up front instead of silently doing more work.
+const MAX_K: usize = 10_000;
+/// Largest `ef_search` (HNSW beam width) a single query may request.
+const MAX_EF_SEARCH: usize = 10_000;
+
+type ApiError = (StatusCode, Json<ErrorResponse>);
+
+fn bad_request(error: impl Into<String>) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: error.into(),
+        }),
+    )
+}
+
+/// Reject out-of-range `k` / `ef_search` before touching an index.
+fn validate_search_params(k: usize, ef_search: Option<usize>) -> Result<(), ApiError> {
+    if !(1..=MAX_K).contains(&k) {
+        return Err(bad_request(format!("k must be between 1 and {MAX_K}")));
+    }
+    if let Some(ef) = ef_search
+        && !(1..=MAX_EF_SEARCH).contains(&ef)
+    {
+        return Err(bad_request(format!(
+            "ef_search must be between 1 and {MAX_EF_SEARCH}"
+        )));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -148,6 +182,7 @@ async fn main() {
     let sq8 = Arc::new(RwLock::new(load_sq8_snapshot()));
     let ivfpq = Arc::new(RwLock::new(load_ivfpq_snapshot()));
     let shutdown = Arc::new(tokio::sync::Notify::new());
+    spawn_auto_flush(Arc::clone(&index));
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -197,6 +232,37 @@ async fn shutdown_signal(shutdown: Arc<tokio::sync::Notify>) {
 async fn shutdown_handler(State(state): State<AppState>) -> StatusCode {
     state.shutdown.notify_one();
     StatusCode::ACCEPTED
+}
+
+/// Periodically flush vectors + graph snapshot so a hard kill loses at most
+/// one interval of graph freshness instead of everything since startup.
+///
+/// `QUIVER_FLUSH_INTERVAL_SECS` sets the period (default 300); 0 disables.
+/// Only the HNSW index is flushed — quantized snapshots are immutable.
+fn spawn_auto_flush(index: SharedIndex) {
+    let secs: u64 = env::var("QUIVER_FLUSH_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    if secs == 0 {
+        return;
+    }
+    tracing::info!(interval_secs = secs, "auto-flush enabled");
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+        loop {
+            ticker.tick().await;
+            // The flush fsyncs under the write lock; run it on the blocking
+            // pool so it never stalls an async worker thread.
+            let index = Arc::clone(&index);
+            let result = tokio::task::spawn_blocking(move || index.write().unwrap().flush()).await;
+            match result {
+                Ok(Ok(())) => tracing::debug!("auto-flush completed"),
+                Ok(Err(e)) => tracing::error!(error = %e, "auto-flush failed"),
+                Err(e) => tracing::error!(error = %e, "auto-flush task panicked"),
+            }
+        }
+    });
 }
 
 async fn health() -> &'static str {
@@ -293,14 +359,7 @@ async fn search(
     State(state): State<AppState>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
-    if request.k < 1 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "k must be at least 1".into(),
-            }),
-        ));
-    }
+    validate_search_params(request.k, request.ef_search)?;
     let hits = run_search(
         &state.index.read().unwrap(),
         &request.vector,
@@ -324,13 +383,8 @@ async fn search_batch(
             }),
         ));
     }
-    if request.queries.iter().any(|query| query.k < 1) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "k must be at least 1 for every query".into(),
-            }),
-        ));
+    for query in &request.queries {
+        validate_search_params(query.k, query.ef_search)?;
     }
     let index = state.index.read().unwrap();
     let mut results = Vec::with_capacity(request.queries.len());
@@ -400,14 +454,7 @@ async fn search_sq8(
     State(state): State<AppState>,
     Json(request): Json<Sq8SearchRequest>,
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
-    if request.k < 1 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "k must be at least 1".into(),
-            }),
-        ));
-    }
+    validate_search_params(request.k, None)?;
     let guard = state.sq8.read().unwrap();
     let index = guard.as_ref().ok_or_else(|| quantized_unavailable("SQ8"))?;
     let hits = index
@@ -430,14 +477,7 @@ async fn search_ivfpq(
     State(state): State<AppState>,
     Json(request): Json<IvfPqSearchRequest>,
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, Json<ErrorResponse>)> {
-    if request.k < 1 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "k must be at least 1".into(),
-            }),
-        ));
-    }
+    validate_search_params(request.k, None)?;
     let guard = state.ivfpq.read().unwrap();
     let index = guard
         .as_ref()
@@ -466,6 +506,7 @@ async fn search_ivfpq(
 fn api_error(error: quiver_core::error::QuiverError) -> (StatusCode, Json<ErrorResponse>) {
     let status = match &error {
         quiver_core::error::QuiverError::DimensionMismatch { .. }
+        | quiver_core::error::QuiverError::InvalidInput(_)
         | quiver_core::error::QuiverError::EmptyIndex => StatusCode::BAD_REQUEST,
         quiver_core::error::QuiverError::NotFound(_) => StatusCode::NOT_FOUND,
         quiver_core::error::QuiverError::InvalidFormat(_)

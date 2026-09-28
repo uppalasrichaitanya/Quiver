@@ -298,7 +298,7 @@ impl IvfPqIndex {
             });
         }
         if query.iter().any(|value| !value.is_finite()) {
-            return Err(QuiverError::InvalidFormat(
+            return Err(QuiverError::InvalidInput(
                 "IVF-PQ queries must contain only finite values".to_owned(),
             ));
         }

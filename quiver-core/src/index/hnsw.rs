@@ -64,6 +64,14 @@ pub struct HnswConfig {
     pub ml: f64,
     /// Maximum tombstone ratio before triggering compaction (e.g., 0.2 = 20%).
     pub max_tombstone_ratio: f64,
+    /// Maximum WAL size in bytes before triggering compaction.
+    ///
+    /// `flush` checkpoints replay-redundant inserts away, but deletes and
+    /// metadata mutations (`InsertMeta`/`UpdateMeta`/`ClearMeta`) are retained
+    /// as the durable tombstone/fallback source — without this bound an
+    /// update-heavy workload grows the WAL forever. Checked after
+    /// delete/update/clear (never on the insert hot path).
+    pub max_wal_bytes: u64,
     /// Seed used for deterministic HNSW layer assignment.
     pub random_seed: u64,
 }
@@ -82,8 +90,15 @@ impl HnswConfig {
             ef_construction: 200,
             ml: 1.0 / (m as f64).ln(),
             max_tombstone_ratio: 0.2,
+            max_wal_bytes: 64 * 1024 * 1024,
             random_seed: 42,
         }
+    }
+
+    /// Set the WAL-size compaction threshold (builder pattern).
+    pub fn with_max_wal_bytes(mut self, bytes: u64) -> Self {
+        self.max_wal_bytes = bytes;
+        self
     }
 
     /// Set ef_construction (builder pattern). Values below 1 are clamped to 1,
@@ -405,14 +420,43 @@ impl HnswIndex {
     /// (see [`VectorStore::update_metadata`]); unknown or deleted IDs return
     /// [`QuiverError::NotFound`](crate::error::QuiverError::NotFound).
     pub fn update_metadata(&mut self, vector_id: u64, metadata: Metadata) -> Result<()> {
-        self.store.update_metadata(vector_id, metadata)
+        self.store.update_metadata(vector_id, metadata)?;
+        self.compact_if_wal_large()?;
+        Ok(())
     }
 
     /// Remove the metadata attached to a live vector.
     ///
     /// Same durability contract as [`Self::update_metadata`].
     pub fn clear_metadata(&mut self, vector_id: u64) -> Result<()> {
-        self.store.clear_metadata(vector_id)
+        self.store.clear_metadata(vector_id)?;
+        self.compact_if_wal_large()?;
+        Ok(())
+    }
+
+    /// Bound the WAL at [`HnswConfig::max_wal_bytes`].
+    ///
+    /// A cheap `flush` runs first: it checkpoints replay-redundant vector
+    /// payloads away, which is usually enough (a WAL of unflushed inserts
+    /// must not force a full rebuild). Only when the retained delete/metadata
+    /// entries alone still exceed the bound does compaction run — it rewrites
+    /// live vectors into a fresh store and rebuilds the graph. Returns whether
+    /// compaction ran.
+    fn compact_if_wal_large(&mut self) -> Result<bool> {
+        if self.store.wal_len()? <= self.config.max_wal_bytes {
+            return Ok(false);
+        }
+        self.flush()?;
+        if self.store.wal_len()? > self.config.max_wal_bytes {
+            tracing::info!(
+                threshold = self.config.max_wal_bytes,
+                "WAL size exceeded threshold — compacting index"
+            );
+            self.compact()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Validate a vector before it touches storage or the graph: it must have
@@ -427,7 +471,7 @@ impl HnswIndex {
             });
         }
         if vector.iter().any(|value| !value.is_finite()) {
-            return Err(QuiverError::InvalidFormat(
+            return Err(QuiverError::InvalidInput(
                 "HNSW vectors must contain only finite values".to_owned(),
             ));
         }
@@ -554,6 +598,10 @@ impl HnswIndex {
         }
 
         let metric = self.store.metric();
+        // `k` is caller-controlled (e.g. straight from an HTTP body): size the
+        // heap by the candidate count so a huge `k` cannot request an
+        // allocation that aborts the process.
+        let k = k.min(candidates.len());
         let mut heap: BinaryHeap<SearchResult> = BinaryHeap::with_capacity(k + 1);
         for vector_id in candidates {
             // Tombstones share the store's deletion set with the graph
@@ -644,6 +692,8 @@ impl HnswIndex {
                     "Tombstone ratio exceeded threshold — compacting index"
                 );
                 self.compact()?;
+            } else {
+                self.compact_if_wal_large()?;
             }
         }
 
@@ -2344,6 +2394,68 @@ mod tests {
         assert!(index.update_metadata(999, int_metadata("cat", 1)).is_err());
         index.delete(id).unwrap();
         assert!(index.clear_metadata(id).is_err());
+    }
+
+    #[test]
+    fn test_wal_size_triggers_compaction_on_update() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        // Disable the tombstone-ratio trigger so only the WAL bound fires.
+        index.config.max_tombstone_ratio = 1.0;
+        index.config.max_wal_bytes = 1;
+        let id = index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        index.update_metadata(id, int_metadata("cat", 2)).unwrap();
+
+        // Compaction cleared the retained WAL and preserved data + metadata.
+        assert!(index.wal_len().unwrap() <= 64);
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 2i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, id);
+        // Plain search still works after the rebuild.
+        let results = index.search(&[1.0, 0.0], 1, 10).unwrap();
+        assert_eq!(results[0].vector_id, id);
+    }
+
+    #[test]
+    fn test_wal_bound_flushes_before_compacting() {
+        let (_dir, mut index) = setup(8, Metric::L2, 8);
+        index.config.max_tombstone_ratio = 1.0;
+        index.config.max_wal_bytes = 20_000;
+        for i in 0..500 {
+            let mut vector = [0.1f32; 8];
+            vector[0] = i as f32;
+            index.insert(&vector).unwrap(); // unflushed plain inserts
+        }
+        assert!(index.wal_len().unwrap() > 20_000);
+
+        index.delete(1).unwrap();
+
+        // The flush checkpointed the insert payloads; no rebuild was needed,
+        // so the tombstone is still in the graph.
+        assert!(index.wal_len().unwrap() <= 20_000);
+        assert_eq!(index.total_nodes(), 500);
+        assert_eq!(index.len(), 499);
+    }
+
+    #[test]
+    fn test_selective_scan_huge_k_does_not_abort() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        let id = index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        // A caller-controlled k this large used to size a ~24 PB allocation.
+        let results = index
+            .search_filtered(&[0.0, 0.0], 1_000_000_000_000_000, 10, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, id);
+        let results = index
+            .search_filtered(&[0.0, 0.0], usize::MAX, 10, &eq("cat", 1i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
