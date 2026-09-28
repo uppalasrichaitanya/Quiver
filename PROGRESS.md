@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-09-28
 > **Purpose:** Current implementation status and next-step context.
-> **Git:** `main` is 1 commit ahead of `origin` (github.com/uppalasrichaitanya/Quiver) by the crash-safe WAL checkpoint (`f6e57a1`). Everything through the 2026-09-04 robustness-hardening pass (`abd5f9e`) is committed locally.
+> **Git:** `main` is in sync with `origin` (github.com/uppalasrichaitanya/Quiver) through `6107480` (`/metrics` endpoint). Includes the crash-safe WAL checkpoint (`f6e57a1`), SQ8/IVF-PQ save/load (`c745c38`), and the 2026-09-04 robustness-hardening pass (`abd5f9e`).
 
 ## Architecture
 
