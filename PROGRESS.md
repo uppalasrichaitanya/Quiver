@@ -1,15 +1,15 @@
 # Quiver - Project Progress and Context Transfer
 
-> **Last updated:** 2026-09-04
+> **Last updated:** 2026-09-28
 > **Purpose:** Current implementation status and next-step context.
-> **Git:** `main` is ahead of `origin` (github.com/uppalasrichaitanya/Quiver) by the IVF-PQ implementation, cross-validation test, SIFT1M benchmark, IVF-PQ documentation, and the 2026-09-04 robustness-hardening pass. Everything through the filter-aware filtered-search traversal (2026-08-24) is pushed.
+> **Git:** `main` is 1 commit ahead of `origin` (github.com/uppalasrichaitanya/Quiver) by the crash-safe WAL checkpoint (`f6e57a1`). Everything through the 2026-09-04 robustness-hardening pass (`abd5f9e`) is committed locally.
 
 ## Architecture
 
 Quiver is a portfolio-grade, single-node, embeddable vector search engine in Rust.
 
 ```text
-quiver-core/    mmap storage, WAL, recovery, distances, brute-force, HNSW, SQ8
+quiver-core/    mmap storage, WAL, recovery, distances, brute-force, HNSW, SQ8, IVF-PQ
 quiver-server/  Axum REST API with restart-safe open-or-create lifecycle
 quiver-py/      PyO3 local Index API
 fuzz/           file-format libFuzzer target and seed corpus
@@ -37,7 +37,9 @@ benchmarks/     reproducible Criterion and SIFT1M comparisons
 
 ## Verification Status
 
-The latest run has **199 `quiver-core` unit tests plus 1 IVF-PQ cross-validation integration test** and **11 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence, batch search, graceful-shutdown snapshot persistence, metadata/filtered search incl. survival across a graceful restart, and HTTP error mapping/invalid-input handling). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing. The Python bindings were verified with a maturin-built extension smoke test (metadata insert + Eq/And/bool/float filters + malformed-filter rejection).
+The latest run has **201 `quiver-core` unit tests plus 1 IVF-PQ cross-validation integration test** and **11 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence, batch search, graceful-shutdown snapshot persistence, metadata/filtered search incl. survival across a graceful restart, and HTTP error mapping/invalid-input handling). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing. The Python bindings were verified with a maturin-built extension smoke test (metadata insert + Eq/And/bool/float filters + malformed-filter rejection).
+
+Crash-safe WAL checkpoint (2026-09-28, `f6e57a1`): `Wal::checkpoint` no longer rewrites the log in place. It writes `.checkpoint.tmp`, fsyncs, renames via `.checkpoint.bak` with a `.checkpoint.marker` state machine (`prepared`/`old_moved`/`installed`), fsyncs the parent dir, and `Wal::open` recovers any interrupted checkpoint. Covered by `test_kill_during_wal_checkpoint_recovers_delete` across all three failpoints.
 
 ## Known Limitations
 
