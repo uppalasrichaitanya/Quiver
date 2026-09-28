@@ -18,9 +18,9 @@
 //! the WAL as `InsertMeta` entries, and checkpointed to a CRC32-protected
 //! `<data_path>.meta` snapshot on `flush`/`compact`. On `open` the snapshot is
 //! loaded when it validates; otherwise metadata is rebuilt from WAL replay.
-
 use memmap2::{MmapMut, MmapOptions};
-use std::collections::HashSet;
+
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -103,6 +103,15 @@ pub struct VectorStore {
     /// Metadata attached to each physical slot, parallel to `vector_ids`.
     /// `None` for slots whose vector was inserted without metadata.
     metadata: Vec<Option<Metadata>>,
+    /// Secondary field index: `(field, value-json)` → vector IDs carrying it.
+    ///
+    /// Backs the selective-filter fast path in `search_filtered`: conjunctive
+    /// `Eq` filters resolve to posting-list intersections instead of graph
+    /// traversal. Postings hold IDs (stable across compaction; slots are not)
+    /// and may contain deleted IDs — readers filter them. Rebuilt from
+    /// scratch on `open` (covers replay and compaction); mutated incrementally
+    /// on the live paths below.
+    field_index: BTreeMap<(String, String), Vec<u64>>,
 }
 
 impl VectorStore {
@@ -154,6 +163,7 @@ impl VectorStore {
             deleted_ids: HashSet::new(),
             vector_ids: Vec::new(),
             metadata: Vec::new(),
+            field_index: BTreeMap::new(),
         })
     }
 
@@ -188,6 +198,7 @@ impl VectorStore {
             deleted_ids: HashSet::new(),
             vector_ids: parsed.vector_ids,
             metadata,
+            field_index: BTreeMap::new(),
         };
 
         // Load the metadata snapshot when present and valid. A missing or
@@ -265,6 +276,12 @@ impl VectorStore {
             }
         }
 
+        // Rebuild the field index from the recovered state: replay bypasses
+        // the live mutation paths (insert_raw writes slots directly), so the
+        // incremental postings cannot observe it. This also covers compaction,
+        // which reopens through `open`.
+        store.rebuild_field_index();
+
         Ok(store)
     }
 
@@ -304,7 +321,10 @@ impl VectorStore {
         ordinary_write_failpoint("wal_durable");
 
         // Then write to the main store
-        self.insert_raw(vector_id, data, metadata)?;
+        self.insert_raw(vector_id, data, metadata.clone())?;
+        if let Some(entry) = metadata {
+            self.index_metadata(vector_id, &entry);
+        }
 
         Ok(vector_id)
     }
@@ -378,7 +398,10 @@ impl VectorStore {
         for (i, data) in batch.iter().enumerate() {
             let vector_id = base + 1 + i as u64;
             let meta = metadata.and_then(|slice| slice[i].clone());
-            self.insert_raw(vector_id, data, meta)?;
+            self.insert_raw(vector_id, data, meta.clone())?;
+            if let Some(entry) = meta {
+                self.index_metadata(vector_id, &entry);
+            }
         }
 
         Ok(ids)
@@ -400,6 +423,11 @@ impl VectorStore {
         let wal = self.wal.as_mut().expect("vector store WAL is open");
         wal.log_delete(vector_id)?;
         wal.flush()?;
+        if let Some(slot) = self.slot_for_id(vector_id)
+            && let Some(entry) = self.metadata[slot].clone()
+        {
+            self.deindex_metadata(vector_id, &entry);
+        }
         self.deleted_ids.insert(vector_id);
         Ok(())
     }
@@ -415,7 +443,10 @@ impl VectorStore {
         let wal = self.wal.as_mut().expect("vector store WAL is open");
         wal.log_update_meta(vector_id, &metadata)?;
         wal.flush()?;
-        self.metadata[slot] = Some(metadata);
+        if let Some(previous) = self.metadata[slot].replace(metadata.clone()) {
+            self.deindex_metadata(vector_id, &previous);
+        }
+        self.index_metadata(vector_id, &metadata);
         Ok(())
     }
 
@@ -428,7 +459,9 @@ impl VectorStore {
         let wal = self.wal.as_mut().expect("vector store WAL is open");
         wal.log_clear_meta(vector_id)?;
         wal.flush()?;
-        self.metadata[slot] = None;
+        if let Some(previous) = self.metadata[slot].take() {
+            self.deindex_metadata(vector_id, &previous);
+        }
         Ok(())
     }
 
@@ -468,6 +501,61 @@ impl VectorStore {
             self.header.vector_count
         );
         self.metadata.get(slot).and_then(|entry| entry.as_ref())
+    }
+
+    /// Posting list for one `(field, value)` pair: IDs of live-at-index-time
+    /// vectors carrying it. Values are JSON-encoded [`MetaValue`]s, so only
+    /// `Eq`-identical values share a posting. May contain deleted IDs;
+    /// readers must filter them.
+    pub(crate) fn field_postings(&self, key: &str, value_json: &str) -> Option<&[u64]> {
+        self.field_index
+            .get(&(key.to_owned(), value_json.to_owned()))
+            .map(Vec::as_slice)
+    }
+
+    /// Canonical encoding of a metadata value for field-index keys.
+    pub(crate) fn field_value_key(value: &crate::metadata::MetaValue) -> String {
+        serde_json::to_string(value).expect("MetaValue always serializes to JSON")
+    }
+
+    /// Rebuild the field index from the current slot metadata.
+    fn rebuild_field_index(&mut self) {
+        self.field_index.clear();
+        let ids = self.vector_ids.clone();
+        let metadata = self.metadata.clone();
+        for (slot, vector_id) in ids.iter().enumerate() {
+            if self.deleted_ids.contains(vector_id) {
+                continue;
+            }
+            if let Some(entry) = metadata.get(slot).and_then(|item| item.as_ref()) {
+                self.index_metadata(*vector_id, entry);
+            }
+        }
+    }
+
+    /// Add one vector's metadata to the field index.
+    fn index_metadata(&mut self, vector_id: u64, metadata: &Metadata) {
+        for (key, value) in metadata.iter() {
+            self.field_index
+                .entry((key.clone(), Self::field_value_key(value)))
+                .or_default()
+                .push(vector_id);
+        }
+    }
+
+    /// Remove one vector's metadata from the field index.
+    fn deindex_metadata(&mut self, vector_id: u64, metadata: &Metadata) {
+        for (key, value) in metadata.iter() {
+            let pair = (key.clone(), Self::field_value_key(value));
+            if let Some(posting) = self.field_index.get_mut(&pair) {
+                if let Some(pos) = posting.iter().position(|id| *id == vector_id) {
+                    posting.swap_remove(pos);
+                }
+                if posting.is_empty() {
+                    self.field_index.remove(&pair);
+                }
+            }
+        }
     }
 
     /// Read a vector by its slot index (0-based).
@@ -1000,7 +1088,7 @@ impl VectorStore {
     ///
     /// `vector_ids` is strictly increasing (enforced at parse time and by
     /// construction on insert), so binary search applies.
-    fn slot_for_id(&self, vector_id: u64) -> Option<usize> {
+    pub(crate) fn slot_for_id(&self, vector_id: u64) -> Option<usize> {
         self.vector_ids.binary_search(&vector_id).ok()
     }
 

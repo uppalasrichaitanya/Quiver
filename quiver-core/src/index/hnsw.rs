@@ -42,6 +42,13 @@ const GRAPH_FORMAT_VERSION: u8 = 1;
 /// Size of the graph-snapshot header in bytes (through and including the header CRC).
 const GRAPH_HEADER_SIZE: usize = 84;
 
+/// Maximum posting-list intersection size for the exact-scan fast path in
+/// [`HnswIndex::search_filtered`]. At 128 dimensions SIMD scores a vector in
+/// tens of nanoseconds, so scanning this many candidates plus a top-k heap is
+/// sub-millisecond — far cheaper than graph traversal — while recall is 1.0
+/// by construction. Larger intersections fall back to traversal.
+const SELECTIVE_SCAN_MAX: usize = 32_768;
+
 /// HNSW tuning parameters.
 #[derive(Debug, Clone)]
 pub struct HnswConfig {
@@ -439,9 +446,14 @@ impl HnswIndex {
 
     /// Search for the `k` nearest neighbors whose metadata matches `filter`.
     ///
-    /// Filter-aware traversal: a single best-first pass over layer 0 explores
-    /// matching and non-matching nodes alike as waypoints, keeping the `k`
-    /// closest matching nodes seen so far. The search expands at least
+    /// Two strategies, chosen by selectivity. Conjunctive `Eq` filters with a
+    /// small posting-list intersection (see `SELECTIVE_SCAN_MAX`) take an
+    /// exact-scan fast path: every match is scored with full-precision
+    /// distances, so recall is 1.0 by construction and cost scales with the
+    /// match count instead of the graph size. Everything else uses the
+    /// filter-aware traversal below: a single best-first pass over layer 0
+    /// explores matching and non-matching nodes alike as waypoints, keeping
+    /// the `k` closest matching nodes seen so far. The search expands at least
     /// `max(ef_search, k)` nodes, then stops once the closest unexpanded node
     /// is farther than the farthest kept match — best-first order means no
     /// closer match is reachable without passing through an already-farther
@@ -469,6 +481,10 @@ impl HnswIndex {
             return Ok(Vec::new());
         }
 
+        if let Some(exact) = self.selective_scan(query, k, filter, SELECTIVE_SCAN_MAX) {
+            return Ok(exact);
+        }
+
         let metric = self.store.metric();
         let entry = self.greedy_descent(query, entry_point, metric);
         let matches = self.search_layer_filtered(query, entry, k, ef_search.max(k), metric, filter);
@@ -481,6 +497,93 @@ impl HnswIndex {
                 distance: c.distance,
             })
             .collect())
+    }
+
+    /// Exact-scan fast path for selective conjunctive-`Eq` filters.
+    ///
+    /// Returns `None` when the filter is not a conjunction of `Eq` clauses or
+    /// the intersection exceeds `max_candidates` (the caller falls back to
+    /// graph traversal). Otherwise scores every matching live vector exactly
+    /// and returns the top `k` — recall 1.0 by construction. A clause with no
+    /// posting matches nothing, so the result is empty (not a fallback).
+    fn selective_scan(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &Filter,
+        max_candidates: usize,
+    ) -> Option<Vec<SearchResult>> {
+        let clauses: &[Filter] = match filter {
+            Filter::Eq { .. } => std::slice::from_ref(filter),
+            Filter::And(items) if items.iter().all(|item| matches!(item, Filter::Eq { .. })) => {
+                items
+            }
+            _ => return None,
+        };
+        // Intersect posting lists, smallest first. A missing posting means no
+        // vector carries that value, so the conjunction is empty.
+        let mut postings: Vec<&[u64]> = Vec::with_capacity(clauses.len());
+        for clause in clauses {
+            let Filter::Eq { key, value } = clause else {
+                unreachable!("clauses are Eq-only by construction")
+            };
+            match self
+                .store
+                .field_postings(key, &VectorStore::field_value_key(value))
+            {
+                Some(posting) => postings.push(posting),
+                None => return Some(Vec::new()),
+            }
+        }
+        postings.sort_by_key(|posting| posting.len());
+        let mut candidates: Vec<u64> = postings
+            .first()
+            .map(|posting| posting.to_vec())
+            .unwrap_or_default();
+        candidates.sort_unstable();
+        for posting in postings.iter().skip(1) {
+            let mut sorted = posting.to_vec();
+            sorted.sort_unstable();
+            candidates = intersect_sorted(&candidates, &sorted);
+            if candidates.is_empty() {
+                return Some(Vec::new());
+            }
+        }
+        if candidates.len() > max_candidates {
+            return None;
+        }
+
+        let metric = self.store.metric();
+        let mut heap: BinaryHeap<SearchResult> = BinaryHeap::with_capacity(k + 1);
+        for vector_id in candidates {
+            // Tombstones share the store's deletion set with the graph
+            // (`apply_deletion_state` derives node flags from it); slots
+            // resolve by binary search, so this stays O(log n) per candidate.
+            if self.store.is_deleted(vector_id) {
+                continue;
+            }
+            let Some(slot) = self.store.slot_for_id(vector_id) else {
+                continue;
+            };
+            let Ok(vector) = self.store.get_vector(slot) else {
+                continue;
+            };
+            let result = SearchResult {
+                slot,
+                vector_id,
+                distance: compute_distance(query, vector, metric),
+            };
+            if heap.len() < k {
+                heap.push(result);
+            } else if heap
+                .peek()
+                .is_some_and(|worst| result.distance < worst.distance)
+            {
+                heap.pop();
+                heap.push(result);
+            }
+        }
+        Some(heap.into_sorted_vec())
     }
 
     /// Shared core of [`Self::search`]: return up to `ef` non-deleted results
@@ -1494,6 +1597,24 @@ impl HnswIndex {
     }
 }
 
+/// Intersect two sorted ID slices (two-pointer merge).
+fn intersect_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(left.len().min(right.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2223,6 +2344,114 @@ mod tests {
         assert!(index.update_metadata(999, int_metadata("cat", 1)).is_err());
         index.delete(id).unwrap();
         assert!(index.clear_metadata(id).is_err());
+    }
+
+    #[test]
+    fn test_selective_scan_matches_brute_force_exactly() {
+        use rand::{Rng, SeedableRng};
+
+        let (_dir, mut index) = setup(8, Metric::L2, 16);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut vectors: Vec<Vec<f32>> = Vec::new();
+        for i in 0..200 {
+            let vector: Vec<f32> = (0..8).map(|_| rng.random_range(-1.0..1.0)).collect();
+            let mut md = Metadata::new();
+            md.insert("bucket", (i % 20) as i64);
+            index.insert_with_metadata(&vector, md).unwrap();
+            vectors.push(vector);
+        }
+
+        let filter = eq("bucket", 7i64);
+        let query: Vec<f32> = (0..8).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let results = index.search_filtered(&query, 5, 50, &filter).unwrap();
+
+        // Brute-force ground truth over the matching subset.
+        let mut expected: Vec<(u64, f32)> = vectors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 20 == 7)
+            .map(|(i, v)| {
+                (
+                    i as u64 + 1,
+                    crate::distance::compute_distance(&query, v, Metric::L2),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1));
+        expected.truncate(5);
+
+        assert_eq!(results.len(), 5);
+        for (result, (id, dist)) in results.iter().zip(expected.iter()) {
+            assert_eq!(result.vector_id, *id);
+            assert!((result.distance - dist).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_selective_scan_falls_back_over_limit() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        for i in 0..8 {
+            index
+                .insert_with_metadata(&[i as f32, 0.0], int_metadata("cat", 1))
+                .unwrap();
+        }
+        let filter = eq("cat", 1i64);
+        // Eight matches exceed a limit of two: no fast path.
+        assert!(index.selective_scan(&[0.0, 0.0], 5, &filter, 2).is_none());
+        // A generous limit scans exactly.
+        let fast = index
+            .selective_scan(&[0.0, 0.0], 5, &filter, 32_768)
+            .unwrap();
+        let ids: Vec<u64> = fast.iter().map(|r| r.vector_id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        // Non-Eq filters never take the fast path.
+        let or_filter = Filter::Or(vec![eq("cat", 1i64)]);
+        assert!(
+            index
+                .selective_scan(&[0.0, 0.0], 5, &or_filter, 32_768)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_field_index_tracks_updates_deletes_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("field.qvdb");
+        let wal_path = dir.path().join("field.wal");
+        let config = HnswConfig::new(8);
+        let mut index = HnswIndex::create(&data_path, &wal_path, 2, Metric::L2, config).unwrap();
+        let a = index
+            .insert_with_metadata(&[0.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        let b = index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+        index.update_metadata(b, int_metadata("cat", 2)).unwrap();
+        index.delete(a).unwrap();
+
+        // Only b matches cat == 2 now.
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 2i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, b);
+        assert!(
+            index
+                .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+                .unwrap()
+                .is_empty()
+        );
+
+        // The postings survive a flush + reopen (snapshot + WAL replay).
+        index.flush().unwrap();
+        drop(index);
+        let config = HnswConfig::new(8);
+        let index = HnswIndex::open(&data_path, &wal_path, config).unwrap();
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 2i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, b);
     }
 
     #[test]
