@@ -340,3 +340,88 @@ fn filtered_search_supports_or_in_and_range() {
     assert!(ids.contains(&id_sports_2024));
     drop(server);
 }
+
+#[test]
+fn metadata_update_and_clear_survive_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("server.qvdb");
+    let wal = directory.path().join("server.wal");
+    let address = unused_address();
+
+    let mut first = start_server(&data, &wal, address);
+    wait_until_ready(address);
+    let (id_science_2024, _id_sports_2024, _id_science_1999, _id_bare) = insert_fixture(address);
+
+    // Re-categorize the science-2024 vector as math.
+    let (status, body) = request(
+        address,
+        "PUT",
+        &format!("/vectors/{id_science_2024}/metadata"),
+        r#"{"metadata":{"category":"math","year":2024}}"#,
+    );
+    assert_eq!(status, 204, "update response: {body}");
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":10,"ef_search":50,
+            "filter":{"Eq":{"key":"category","value":"math"}}}"#,
+    );
+    assert_eq!(status, 200, "search after update: {body}");
+    assert_eq!(hit_ids(&body), vec![id_science_2024]);
+
+    // Unknown IDs are 404.
+    let (status, _) = request(
+        address,
+        "PUT",
+        "/vectors/9999/metadata",
+        r#"{"metadata":{"category":"math"}}"#,
+    );
+    assert_eq!(status, 404);
+    let (status, _) = request(address, "DELETE", "/vectors/9999/metadata", "");
+    assert_eq!(status, 404);
+
+    let (status, _) = request(address, "POST", "/shutdown", "");
+    assert_eq!(status, 202, "shutdown should be accepted");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let exited = loop {
+        match first.0.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => break false,
+        }
+    };
+    assert!(exited, "server should exit after /shutdown");
+    std::mem::forget(first);
+
+    // The update survives the restart; clearing it does too.
+    let second = start_server(&data, &wal, address);
+    wait_until_ready(address);
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":10,"ef_search":50,
+            "filter":{"Eq":{"key":"category","value":"math"}}}"#,
+    );
+    assert_eq!(status, 200, "search after restart: {body}");
+    assert_eq!(hit_ids(&body), vec![id_science_2024]);
+
+    let (status, body) = request(
+        address,
+        "DELETE",
+        &format!("/vectors/{id_science_2024}/metadata"),
+        "",
+    );
+    assert_eq!(status, 204, "clear response: {body}");
+    let (status, body) = request(
+        address,
+        "POST",
+        "/search",
+        r#"{"vector":[1.0,0.0,0.0],"k":10,"ef_search":50,
+            "filter":{"Eq":{"key":"category","value":"math"}}}"#,
+    );
+    assert_eq!(status, 200, "search after clear: {body}");
+    assert!(hit_ids(&body).is_empty(), "response: {body}");
+    drop(second);
+}

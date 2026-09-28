@@ -8,13 +8,16 @@
 //! Offset  Size       Field
 //! ------  ---------  -----
 //! 0       4          Entry length in bytes (u32 LE, excludes this field and checksum)
-//! 4       1          Operation type (0 = Insert, 1 = Delete, 2 = InsertMeta)
+//! 4       1          Operation type (0 = Insert, 1 = Delete, 2 = InsertMeta,
+//!                    3 = UpdateMeta, 4 = ClearMeta)
 //! 5       8          Vector ID (u64 LE)
 //! 13      ...        Operation payload:
 //!                    - Insert: N*4 bytes of vector data (N f32s, LE)
 //!                    - Delete: none
 //!                    - InsertMeta: metadata length (u32 LE) + metadata bytes
 //!                      (see `Metadata::to_bytes`) + vector data (N f32s, LE)
+//!                    - UpdateMeta: metadata length (u32 LE) + metadata bytes
+//!                    - ClearMeta: none
 //! end     4          CRC32 checksum of the length prefix + body
 //! ```
 //!
@@ -22,6 +25,9 @@
 //! code rather than an extension of `Insert` so the `Insert` payload stays a
 //! pure f32 tail; pre-metadata binaries never reach it because they reject
 //! version-3 data files before reading the WAL.
+//!
+//! `UpdateMeta` (op 3) replaces the metadata of an existing vector without
+//! touching its vector data; `ClearMeta` (op 4) removes it.
 //!
 //! ## Recovery
 //!
@@ -69,6 +75,10 @@ pub enum WalOp {
     Delete = 1,
     /// Insert a vector with the given ID, metadata, and data.
     InsertMeta = 2,
+    /// Replace the metadata of an existing vector (no vector data).
+    UpdateMeta = 3,
+    /// Remove the metadata of an existing vector.
+    ClearMeta = 4,
 }
 
 impl WalOp {
@@ -77,6 +87,8 @@ impl WalOp {
             0 => Some(WalOp::Insert),
             1 => Some(WalOp::Delete),
             2 => Some(WalOp::InsertMeta),
+            3 => Some(WalOp::UpdateMeta),
+            4 => Some(WalOp::ClearMeta),
             _ => None,
         }
     }
@@ -91,7 +103,7 @@ pub struct WalEntry {
     pub vector_id: u64,
     /// The vector data (present for Insert and InsertMeta operations).
     pub vector_data: Option<Vec<f32>>,
-    /// The metadata (present only for InsertMeta operations).
+    /// The metadata (present for InsertMeta and UpdateMeta operations).
     pub metadata: Option<Metadata>,
 }
 
@@ -134,6 +146,20 @@ impl Wal {
     /// Append a delete entry to the WAL.
     pub fn log_delete(&mut self, vector_id: u64) -> Result<()> {
         let entry_body = Self::serialize_delete(vector_id);
+        self.write_entry(&entry_body)?;
+        Ok(())
+    }
+
+    /// Append a metadata-replacement entry to the WAL.
+    pub fn log_update_meta(&mut self, vector_id: u64, metadata: &Metadata) -> Result<()> {
+        let entry_body = Self::serialize_update_meta(vector_id, metadata);
+        self.write_entry(&entry_body)?;
+        Ok(())
+    }
+
+    /// Append a metadata-removal entry to the WAL.
+    pub fn log_clear_meta(&mut self, vector_id: u64) -> Result<()> {
+        let entry_body = Self::serialize_clear_meta(vector_id);
         self.write_entry(&entry_body)?;
         Ok(())
     }
@@ -366,6 +392,15 @@ impl Wal {
             WalOp::Insert => Err(QuiverError::InvalidFormat(
                 "WAL checkpoint must not retain Insert entries".to_owned(),
             )),
+            WalOp::UpdateMeta => {
+                let metadata = entry.metadata.as_ref().ok_or_else(|| {
+                    QuiverError::InvalidFormat(
+                        "WAL UpdateMeta entry is missing metadata".to_owned(),
+                    )
+                })?;
+                Ok(Self::serialize_update_meta(entry.vector_id, metadata))
+            }
+            WalOp::ClearMeta => Ok(Self::serialize_clear_meta(entry.vector_id)),
         }
     }
 
@@ -534,6 +569,24 @@ impl Wal {
         buf
     }
 
+    fn serialize_update_meta(vector_id: u64, metadata: &Metadata) -> Vec<u8> {
+        let meta_bytes = metadata.to_bytes();
+        let mut buf = Vec::with_capacity(1 + 8 + 4 + meta_bytes.len());
+        buf.write_u8(WalOp::UpdateMeta as u8).unwrap();
+        buf.write_u64::<LittleEndian>(vector_id).unwrap();
+        buf.write_u32::<LittleEndian>(meta_bytes.len() as u32)
+            .unwrap();
+        buf.write_all(&meta_bytes).unwrap();
+        buf
+    }
+
+    fn serialize_clear_meta(vector_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 8);
+        buf.write_u8(WalOp::ClearMeta as u8).unwrap();
+        buf.write_u64::<LittleEndian>(vector_id).unwrap();
+        buf
+    }
+
     fn parse_entry_body(body: &[u8]) -> Option<WalEntry> {
         if body.is_empty() {
             return None;
@@ -592,6 +645,29 @@ impl Wal {
                 })
             }
             WalOp::Delete => Some(WalEntry {
+                op,
+                vector_id,
+                vector_data: None,
+                metadata: None,
+            }),
+            WalOp::UpdateMeta => {
+                let remaining = &body[9..];
+                let mut cursor = io::Cursor::new(remaining);
+                let meta_len = usize::try_from(cursor.read_u32::<LittleEndian>().ok()?)
+                    .ok()?
+                    .checked_add(4)?;
+                if remaining.len() != meta_len {
+                    return None; // Metadata blob truncated or trailing garbage
+                }
+                let metadata = Metadata::from_bytes(&remaining[4..meta_len]).ok()?;
+                Some(WalEntry {
+                    op,
+                    vector_id,
+                    vector_data: None,
+                    metadata: Some(metadata),
+                })
+            }
+            WalOp::ClearMeta => Some(WalEntry {
                 op,
                 vector_id,
                 vector_data: None,
@@ -824,6 +900,56 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].op, WalOp::Insert);
         assert_eq!(entries[2].vector_id, 4);
+    }
+
+    #[test]
+    fn test_wal_update_and_clear_meta_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_update_meta(7, &sample_metadata()).unwrap();
+            wal.log_clear_meta(9).unwrap();
+            wal.flush().unwrap();
+        }
+
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, WalOp::UpdateMeta);
+        assert_eq!(entries[0].vector_id, 7);
+        assert_eq!(entries[0].metadata.as_ref(), Some(&sample_metadata()));
+        assert!(entries[0].vector_data.is_none());
+        assert_eq!(entries[1].op, WalOp::ClearMeta);
+        assert_eq!(entries[1].vector_id, 9);
+    }
+
+    #[test]
+    fn test_checkpoint_retains_metadata_updates() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_insert(1, &[1.0]).unwrap();
+            wal.log_update_meta(1, &sample_metadata()).unwrap();
+            wal.log_clear_meta(2).unwrap();
+            wal.flush().unwrap();
+
+            let (entries, _) = Wal::read_entries(&path).unwrap();
+            let keep: Vec<&WalEntry> = entries
+                .iter()
+                .filter(|entry| entry.op != WalOp::Insert)
+                .collect();
+            wal.checkpoint(&keep).unwrap();
+        }
+
+        let (entries, _) = Wal::read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, WalOp::UpdateMeta);
+        assert_eq!(entries[0].metadata.as_ref(), Some(&sample_metadata()));
+        assert_eq!(entries[1].op, WalOp::ClearMeta);
+        assert_eq!(entries[1].vector_id, 2);
     }
 
     #[test]

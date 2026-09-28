@@ -238,6 +238,26 @@ impl VectorStore {
                     WalOp::Delete => {
                         store.deleted_ids.insert(entry.vector_id);
                     }
+                    WalOp::UpdateMeta => {
+                        // Updates always follow their insert in log order, so
+                        // the slot exists unless the vector was deleted (in
+                        // which case the update is moot).
+                        if let Some(slot) = store.slot_for_id(entry.vector_id)
+                            && !store.deleted_ids.contains(&entry.vector_id)
+                            && let Some(ref metadata) = entry.metadata
+                        {
+                            store.metadata[slot] = Some(metadata.clone());
+                            recovered = true;
+                        }
+                    }
+                    WalOp::ClearMeta => {
+                        if let Some(slot) = store.slot_for_id(entry.vector_id)
+                            && !store.deleted_ids.contains(&entry.vector_id)
+                        {
+                            store.metadata[slot] = None;
+                            recovered = true;
+                        }
+                    }
                 }
             }
             if recovered {
@@ -382,6 +402,46 @@ impl VectorStore {
         wal.flush()?;
         self.deleted_ids.insert(vector_id);
         Ok(())
+    }
+
+    /// Replace the metadata attached to a live vector.
+    ///
+    /// The replacement is fsynced to the WAL as an `UpdateMeta` entry before
+    /// the in-memory state is updated, so a crash cannot acknowledge an
+    /// update that is then lost. Returns [`QuiverError::NotFound`] for
+    /// unknown or deleted IDs.
+    pub fn update_metadata(&mut self, vector_id: u64, metadata: Metadata) -> Result<()> {
+        let slot = self.live_slot(vector_id)?;
+        let wal = self.wal.as_mut().expect("vector store WAL is open");
+        wal.log_update_meta(vector_id, &metadata)?;
+        wal.flush()?;
+        self.metadata[slot] = Some(metadata);
+        Ok(())
+    }
+
+    /// Remove the metadata attached to a live vector.
+    ///
+    /// Same durability contract as [`Self::update_metadata`]; unknown or
+    /// deleted IDs return [`QuiverError::NotFound`].
+    pub fn clear_metadata(&mut self, vector_id: u64) -> Result<()> {
+        let slot = self.live_slot(vector_id)?;
+        let wal = self.wal.as_mut().expect("vector store WAL is open");
+        wal.log_clear_meta(vector_id)?;
+        wal.flush()?;
+        self.metadata[slot] = None;
+        Ok(())
+    }
+
+    /// Resolve a vector ID to its slot, rejecting unknown and deleted IDs.
+    fn live_slot(&self, vector_id: u64) -> Result<usize> {
+        if vector_id == 0
+            || vector_id > self.header.max_vector_id
+            || self.deleted_ids.contains(&vector_id)
+        {
+            return Err(QuiverError::NotFound(vector_id));
+        }
+        self.slot_for_id(vector_id)
+            .ok_or(QuiverError::NotFound(vector_id))
     }
 
     /// Return whether a vector ID has been durably tombstoned.
@@ -553,8 +613,8 @@ impl VectorStore {
 
     /// Replace the WAL with a durable copy containing only the entries that
     /// still need replay. Plain Insert entries are skipped by replay because
-    /// their IDs are at or below the persisted `max_vector_id`, while Delete
-    /// and InsertMeta entries are retained.
+    /// their IDs are at or below the persisted `max_vector_id`, while Delete,
+    /// InsertMeta, UpdateMeta, and ClearMeta entries are retained.
     fn checkpoint_wal(&mut self) -> Result<()> {
         let (entries, _) = Wal::read_entries(&self.wal_path)?;
         let keep: Vec<&WalEntry> = entries
@@ -1734,6 +1794,84 @@ mod tests {
         let result = store.insert_batch_with_metadata(&[&a], &[Some(sample_metadata()), None]);
         assert!(result.is_err());
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_update_and_clear_metadata() {
+        let (_dir, mut store) = setup(2);
+        let id = store.insert(&[1.0, 2.0]).unwrap();
+        assert_eq!(store.metadata(0), None);
+
+        store.update_metadata(id, sample_metadata()).unwrap();
+        assert_eq!(store.metadata(0), Some(&sample_metadata()));
+
+        store.update_metadata(id, other_metadata()).unwrap();
+        assert_eq!(store.metadata(0), Some(&other_metadata()));
+
+        store.clear_metadata(id).unwrap();
+        assert_eq!(store.metadata(0), None);
+        // Clearing twice is idempotent.
+        store.clear_metadata(id).unwrap();
+        assert_eq!(store.metadata(0), None);
+    }
+
+    #[test]
+    fn test_update_metadata_rejects_unknown_and_deleted() {
+        let (_dir, mut store) = setup(2);
+        let id = store
+            .insert_with_metadata(&[1.0, 2.0], sample_metadata())
+            .unwrap();
+        assert!(store.update_metadata(999, sample_metadata()).is_err());
+        assert!(store.clear_metadata(999).is_err());
+        assert!(store.update_metadata(0, sample_metadata()).is_err());
+        store.delete(id).unwrap();
+        assert!(store.update_metadata(id, sample_metadata()).is_err());
+        assert!(store.clear_metadata(id).is_err());
+        // The delete wins: metadata is unchanged by the rejected updates.
+        assert_eq!(store.metadata(0), Some(&sample_metadata()));
+    }
+
+    #[test]
+    fn test_metadata_update_recovers_from_wal_without_flush() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("meta_update_wal.qvdb");
+        let wal_path = dir.path().join("meta_update_wal.wal");
+
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            let id = store
+                .insert_with_metadata(&[1.0, 2.0], sample_metadata())
+                .unwrap();
+            store.update_metadata(id, other_metadata()).unwrap();
+            let bare = store.insert(&[3.0, 4.0]).unwrap();
+            store.update_metadata(bare, sample_metadata()).unwrap();
+            store.clear_metadata(bare).unwrap();
+            // Drop without flushing: updates must survive WAL replay alone.
+        }
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.metadata(0), Some(&other_metadata()));
+        assert_eq!(store.metadata(1), None);
+    }
+
+    #[test]
+    fn test_metadata_update_persists_across_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("meta_update_flush.qvdb");
+        let wal_path = dir.path().join("meta_update_flush.wal");
+
+        {
+            let mut store = VectorStore::create(&data_path, &wal_path, 2, Metric::L2).unwrap();
+            let id = store.insert(&[1.0, 2.0]).unwrap();
+            store.update_metadata(id, sample_metadata()).unwrap();
+            store.flush().unwrap();
+            // Update again after the flush so both the snapshot and the WAL
+            // paths are exercised across the reopen.
+            store.update_metadata(id, other_metadata()).unwrap();
+        }
+
+        let store = VectorStore::open(&data_path, &wal_path).unwrap();
+        assert_eq!(store.metadata(0), Some(&other_metadata()));
     }
 
     #[test]

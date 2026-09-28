@@ -30,7 +30,13 @@ print(index.search([1.0, 0.0, 0.0], k=10, filter={"And": [
 ```
 
 Metadata values may be booleans, integers, floats, or strings. Vectors
-inserted without metadata never match a filter.
+inserted without metadata never match a filter. Metadata can be replaced or
+cleared after insert:
+
+```python
+index.update_metadata(vector_id, {"category": "math", "year": 2025})
+index.clear_metadata(vector_id)
+```
 
 Batch-built quantized indexes are also available. They are L2-only with no
 metadata, no deletes, and no online inserts — build in memory or load a

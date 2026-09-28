@@ -9,6 +9,8 @@ The Axum HTTP API listens on `127.0.0.1:8080` by default. Set `QUIVER_BIND` to o
 - `POST /sq8/search` with `{"vector":[...],"k":10}` searches a pre-built SQ8 snapshot (503 when none loaded)
 - `POST /ivfpq/search` with `{"vector":[...],"k":10,"nprobe":8?,"rerank_factor":0?}` searches a pre-built IVF-PQ snapshot (503 when none loaded)
 - `DELETE /vectors/{id}`
+- `PUT /vectors/{id}/metadata` with `{"metadata":{...}}` replaces a vector's metadata (404 for unknown/deleted IDs)
+- `DELETE /vectors/{id}/metadata` clears a vector's metadata
 - `POST /shutdown` triggers a graceful shutdown (flushes vectors + graph snapshot)
 - `GET /metrics` returns `{"len":...,"dimension":...,"metric":...,"max_level":...,"sq8_len":...?,"ivfpq_len":...?}`
 

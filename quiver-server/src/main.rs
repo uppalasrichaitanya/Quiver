@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use quiver_core::{
     distance::Metric,
@@ -36,6 +36,10 @@ struct InsertRequest {
     vector: Vec<f32>,
     #[serde(default)]
     metadata: Option<Metadata>,
+}
+#[derive(Deserialize)]
+struct UpdateMetadataRequest {
+    metadata: Metadata,
 }
 #[derive(Serialize)]
 struct InsertResponse {
@@ -153,6 +157,10 @@ async fn main() {
         .route("/sq8/search", post(search_sq8))
         .route("/ivfpq/search", post(search_ivfpq))
         .route("/vectors/{id}", delete(remove))
+        .route(
+            "/vectors/{id}/metadata",
+            put(update_metadata).delete(clear_metadata),
+        )
         .route("/shutdown", post(shutdown_handler))
         .with_state(AppState {
             index: Arc::clone(&index),
@@ -345,6 +353,35 @@ async fn remove(
     Path(id): Path<u64>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     state.index.write().unwrap().delete(id).map_err(api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Replace the metadata attached to a live vector.
+async fn update_metadata(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(request): Json<UpdateMetadataRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .index
+        .write()
+        .unwrap()
+        .update_metadata(id, request.metadata)
+        .map_err(api_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove the metadata attached to a live vector.
+async fn clear_metadata(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .index
+        .write()
+        .unwrap()
+        .clear_metadata(id)
+        .map_err(api_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

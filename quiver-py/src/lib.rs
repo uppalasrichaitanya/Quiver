@@ -161,6 +161,21 @@ impl Index {
     fn delete(&mut self, id: u64) -> PyResult<()> {
         self.inner.delete(id).map_err(py_error)
     }
+
+    /// Replace the metadata attached to a live vector.
+    ///
+    /// `metadata` must be a dict of string keys to scalar values, as in
+    /// [`Index::insert`]. Unknown or deleted IDs raise `ValueError`.
+    fn update_metadata(&mut self, id: u64, metadata: Bound<'_, PyAny>) -> PyResult<()> {
+        let json = py_to_json(&metadata)?;
+        let metadata: Metadata = serde_json::from_value(json).map_err(py_error)?;
+        self.inner.update_metadata(id, metadata).map_err(py_error)
+    }
+
+    /// Remove the metadata attached to a live vector.
+    fn clear_metadata(&mut self, id: u64) -> PyResult<()> {
+        self.inner.clear_metadata(id).map_err(py_error)
+    }
 }
 
 fn parse_metric(name: &str) -> PyResult<Metric> {

@@ -392,6 +392,22 @@ impl HnswIndex {
         Ok(ids)
     }
 
+    /// Replace the metadata attached to a live vector.
+    ///
+    /// Durable via an `UpdateMeta` WAL entry plus the `.meta` snapshot sidecar
+    /// (see [`VectorStore::update_metadata`]); unknown or deleted IDs return
+    /// [`QuiverError::NotFound`](crate::error::QuiverError::NotFound).
+    pub fn update_metadata(&mut self, vector_id: u64, metadata: Metadata) -> Result<()> {
+        self.store.update_metadata(vector_id, metadata)
+    }
+
+    /// Remove the metadata attached to a live vector.
+    ///
+    /// Same durability contract as [`Self::update_metadata`].
+    pub fn clear_metadata(&mut self, vector_id: u64) -> Result<()> {
+        self.store.clear_metadata(vector_id)
+    }
+
     /// Validate a vector before it touches storage or the graph: it must have
     /// the index dimension and contain only finite values. Non-finite
     /// components would produce NaN/inf distances that break the total order
@@ -2174,6 +2190,39 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vector_id, matching_id);
+    }
+
+    #[test]
+    fn test_update_and_clear_metadata_reflected_in_filtered_search() {
+        let (_dir, mut index) = setup(2, Metric::L2, 8);
+        let id = index
+            .insert_with_metadata(&[1.0, 0.0], int_metadata("cat", 1))
+            .unwrap();
+
+        index.update_metadata(id, int_metadata("cat", 2)).unwrap();
+        let results = index
+            .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 2i64))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].vector_id, id);
+        assert!(
+            index
+                .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 1i64))
+                .unwrap()
+                .is_empty()
+        );
+
+        index.clear_metadata(id).unwrap();
+        assert!(
+            index
+                .search_filtered(&[0.0, 0.0], 5, 50, &eq("cat", 2i64))
+                .unwrap()
+                .is_empty()
+        );
+        // Unknown and deleted IDs are rejected.
+        assert!(index.update_metadata(999, int_metadata("cat", 1)).is_err());
+        index.delete(id).unwrap();
+        assert!(index.clear_metadata(id).is_err());
     }
 
     #[test]
