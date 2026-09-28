@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-09-28
 > **Purpose:** Current implementation status and next-step context.
-> **Git:** `main` is in sync with `origin` (github.com/uppalasrichaitanya/Quiver) through `6107480` (`/metrics` endpoint). Includes the crash-safe WAL checkpoint (`f6e57a1`), SQ8/IVF-PQ save/load (`c745c38`), and the 2026-09-04 robustness-hardening pass (`abd5f9e`).
+> **Git:** `main` is in sync with `origin` (github.com/uppalasrichaitanya/Quiver). Latest: header CRC (format v4), server auto-flush, WAL-size bound, and the 2026-09-28 audit fixes.
 
 ## Architecture
 
@@ -37,14 +37,14 @@ benchmarks/     reproducible Criterion and SIFT1M comparisons
 
 ## Verification Status
 
-The latest run has **201 `quiver-core` unit tests plus 1 IVF-PQ cross-validation integration test** and **11 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence, batch search, graceful-shutdown snapshot persistence, metadata/filtered search incl. survival across a graceful restart, and HTTP error mapping/invalid-input handling). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing. The Python bindings were verified with a maturin-built extension smoke test (metadata insert + Eq/And/bool/float filters + malformed-filter rejection).
+The latest run (2026-09-28) has **235 `quiver-core` unit tests plus 1 IVF-PQ cross-validation integration test** and **17 `quiver-server` integration tests** passing with zero failures (the server suite covers restart persistence, batch search, graceful-shutdown snapshot persistence, metadata/filtered search incl. survival across a graceful restart, and HTTP error mapping/invalid-input handling). CI also runs clippy, rustfmt, and 60 seconds of file-format fuzzing. The Python bindings were verified with a maturin-built extension smoke test (metadata insert + Eq/And/bool/float filters + malformed-filter rejection).
 
 Crash-safe WAL checkpoint (2026-09-28, `f6e57a1`): `Wal::checkpoint` no longer rewrites the log in place. It writes `.checkpoint.tmp`, fsyncs, renames via `.checkpoint.bak` with a `.checkpoint.marker` state machine (`prepared`/`old_moved`/`installed`), fsyncs the parent dir, and `Wal::open` recovers any interrupted checkpoint. Covered by `test_kill_during_wal_checkpoint_recovers_delete` across all three failpoints.
 
 ## Known Limitations
 
 - HNSW graph topology is persisted as a snapshot on `flush`/`compact` and loaded on `open`, but vectors inserted after the last snapshot still require a rebuild on reopen (the snapshot is only as fresh as the last flush). The HTTP server flushes on graceful shutdown (Ctrl+C or `POST /shutdown`), but a hard kill still leaves the snapshot stale.
-- The 64-byte data-file header carries no checksum (unlike the WAL records and the `.graph`/`.meta` snapshots): a torn header write on power loss can shrink `vector_count`, after which the next insert overwrites the "lost" tail. Fixing it properly is a format change (e.g. dual rotating headers) and is deferred.
+- The 64-byte data-file header carries a CRC32 since format v4 (2026-09-28): a torn or corrupt header is a loud open-time error instead of silently shrinking `vector_count`. Older v1-v3 stores are still readable but unprotected until compacted. There is no automatic header repair.
 - HNSW mutation is single-writer through `&mut self`; the server wraps it in an `RwLock` (parallel reads, exclusive writes).
 - HNSW build is slower than in-memory competitors because Quiver fsyncs a CRC32 WAL during the build, while FAISS/hnswlib build in memory and serialize afterward. Group-commit batch inserts (2026-08-22) cut build time ~2-2.7x, but the durability-during-build cost remains the gap. Search speed and recall are no longer the gap: at M=32/efc200/ef=100 Quiver now measures 2680 QPS / p50 0.38 ms / Recall@10 0.9961, on par with or above FAISS and hnswlib.
 - SQ8 is batch-built with CRC-protected `save`/`load` file snapshots; online recalibration is not implemented.
@@ -69,3 +69,14 @@ $env:PATH = "C:\msys64\mingw64\bin;" + ($env:PATH -replace "C:\\MinGW\\bin;?", "
 5. Persist SQ8 and evaluate quantized HNSW.
 6. IVF-PQ (done, 2026-08-24): implemented per the plan's week-9 de-risking order — numpy reference first (`benchmarks/pq_reference.py`), then the Rust k-means/PQ/inverted-file index cross-validated against the committed trained state, then the SIFT1M `nprobe` sweep with plain-ADC and reranked rows. Results and the IVF-PQ vs HNSW vs SQ8 comparison are recorded in `benchmarks/README.md`. Remaining IVF-PQ work (persistence, server/py exposure, filtered search) is tracked under Known Limitations.
 7. Add packaging, release automation, and generated benchmark charts.
+
+## 2026-09-28 Audit Fixes
+
+A full review found and fixed four bugs, each with a regression test:
+
+1. **Server abort from one request.** The filtered exact-scan fast path sized a heap with a request-supplied `k` (`BinaryHeap::with_capacity(k + 1)`), so `k = 10^15` aborted the process on allocation failure. The core now clamps `k` to the candidate count, and the server rejects `k` / `ef_search` outside 1..=10,000 with 400.
+2. **Legacy v1 store corruption.** Inserting metadata into a v1 store relabeled the header version while the records kept the ID-less v1 layout, which misparsed every record and made the file unopenable. Metadata on v1 stores is now rejected with an error until `compact` migrates the layout.
+3. **Unbounded WAL for metadata inserts.** The WAL checkpoint kept every `InsertMeta` entry, including its full vector payload. It now rewrites them as metadata-only `UpdateMeta` entries, preserving log order and the snapshot-corruption fallback.
+4. **Needless full rebuilds.** The WAL-size bound compacted and rebuilt the whole graph even when a flush (dropping checkpointed insert payloads) would do. It now flushes first and compacts only if the retained entries still exceed the bound.
+
+Also fixed: client input errors (e.g. `1e39`, which overflows f32 to infinity) now map to 400 through a new `QuiverError::InvalidInput` variant instead of 500. Auto-flush runs on Tokio's blocking pool. The README was rewritten, fixing its double-encoded UTF-8.
