@@ -61,6 +61,13 @@ struct SearchHit {
     distance: f32,
 }
 #[derive(Serialize)]
+struct MetricsResponse {
+    len: usize,
+    dimension: u32,
+    metric: String,
+    max_level: usize,
+}
+#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -117,6 +124,7 @@ async fn main() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/vectors", post(insert))
         .route("/search", post(search))
         .route("/search/batch", post(search_batch))
@@ -159,6 +167,16 @@ async fn shutdown_handler(State(state): State<AppState>) -> StatusCode {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+    let index = state.index.read().unwrap();
+    Json(MetricsResponse {
+        len: index.len(),
+        dimension: index.dimension(),
+        metric: format!("{:?}", index.metric()),
+        max_level: index.max_level(),
+    })
 }
 
 async fn insert(
