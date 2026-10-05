@@ -692,9 +692,10 @@ impl VectorStore {
     /// Finally, when both the data file and (if present) the metadata snapshot
     /// are durable, the WAL is checkpointed: its plain Insert entries are now
     /// replay-skipped (their IDs are at or below the persisted
-    /// `max_vector_id`), so only Delete and InsertMeta entries are retained —
-    /// deletes have no other durable home, and InsertMeta keeps the WAL as the
-    /// metadata fallback if the snapshot is later corrupted. Without this, an
+    /// `max_vector_id`), so only Delete and metadata entries are retained —
+    /// deletes have no other durable home, and metadata entries keep the WAL
+    /// as the fallback if the snapshot is later corrupted (InsertMeta payloads
+    /// are rewritten as UpdateMeta; see `checkpoint_wal`). Without this, an
     /// insert-only workload that never crosses the compaction threshold would
     /// grow the WAL without bound, duplicating every vector already in the
     /// data file.
