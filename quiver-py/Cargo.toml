@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Python bindings for the Quiver vector search engine"
+keywords = ["vector", "search", "python", "hnsw", "nearest-neighbor"]
+categories = ["external-ffi-bindings", "algorithms"]
 
 [lib]
 name = "quiver_db"

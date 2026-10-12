@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "REST API server for the Quiver vector search engine"
+keywords = ["vector", "search", "rest-api", "hnsw", "nearest-neighbor"]
+categories = ["web-programming", "algorithms"]
 
 [dependencies]
 quiver-core = { path = "../quiver-core" }

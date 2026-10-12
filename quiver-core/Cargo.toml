@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core vector search library for Quiver: mmap storage, WAL recovery, distance kernels, and HNSW"
+keywords = ["vector", "search", "hnsw", "mmap", "nearest-neighbor"]
+categories = ["algorithms", "data-structures"]
 
 [features]
 default = []
