@@ -1,5 +1,5 @@
 [package]
-name = "quiver-server"
+name = "quiver-vector-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ keywords = ["vector", "search", "rest-api", "hnsw", "nearest-neighbor"]
 categories = ["web-programming", "algorithms"]
 
 [dependencies]
-quiver-core = { path = "../quiver-core" }
+quiver-vector-rs = { path = "../quiver-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

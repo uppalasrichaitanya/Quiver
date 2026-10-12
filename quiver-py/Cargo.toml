@@ -1,5 +1,5 @@
 [package]
-name = "quiver-py"
+name = "quiver-vector-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,6 @@ name = "quiver_db"
 crate-type = ["cdylib"]
 
 [dependencies]
-quiver-core = { path = "../quiver-core" }
+quiver-vector-rs = { path = "../quiver-core" }
 pyo3 = { workspace = true }
 serde_json = { workspace = true }
