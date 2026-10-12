@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use quiver_core::distance::{l2_squared, simd_available};
+use quiver_vector_rs::distance::{l2_squared, simd_available};
 
 fn main() {
     let seconds = std::env::args()

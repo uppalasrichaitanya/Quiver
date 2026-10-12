@@ -16,9 +16,9 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use quiver_core::distance::{Metric, l2_squared};
-use quiver_core::index::hnsw::{HnswConfig, HnswIndex};
-use quiver_core::metadata::{Filter, MetaValue, Metadata};
+use quiver_vector_rs::distance::{Metric, l2_squared};
+use quiver_vector_rs::index::hnsw::{HnswConfig, HnswIndex};
+use quiver_vector_rs::metadata::{Filter, MetaValue, Metadata};
 use serde::Serialize;
 
 const K: usize = 10;

@@ -4,9 +4,9 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use quiver_core::distance::Metric;
-use quiver_core::index::brute_force::BruteForceIndex;
-use quiver_core::index::sq8::Sq8Index;
+use quiver_vector_rs::distance::Metric;
+use quiver_vector_rs::index::brute_force::BruteForceIndex;
+use quiver_vector_rs::index::sq8::Sq8Index;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy)]

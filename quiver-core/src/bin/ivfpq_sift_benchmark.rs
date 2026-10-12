@@ -14,8 +14,8 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use quiver_core::index::SearchResult;
-use quiver_core::index::ivfpq::{IvfPqConfig, IvfPqIndex};
+use quiver_vector_rs::index::SearchResult;
+use quiver_vector_rs::index::ivfpq::{IvfPqConfig, IvfPqIndex};
 use serde::Serialize;
 
 #[derive(Debug)]
