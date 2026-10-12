@@ -13,6 +13,6 @@ name = "quiver_db"
 crate-type = ["cdylib"]
 
 [dependencies]
-quiver-vector-rs = { path = "../quiver-core" }
+quiver-vector-rs = "0.2.0"
 pyo3 = { workspace = true }
 serde_json = { workspace = true }

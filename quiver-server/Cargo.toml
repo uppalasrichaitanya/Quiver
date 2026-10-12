@@ -9,7 +9,7 @@ keywords = ["vector", "search", "rest-api", "hnsw", "nearest-neighbor"]
 categories = ["web-programming", "algorithms"]
 
 [dependencies]
-quiver-vector-rs = { path = "../quiver-core" }
+quiver-vector-rs = "0.2.0"
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
