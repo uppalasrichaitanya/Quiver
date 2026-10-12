@@ -2,7 +2,11 @@
 
 All notable changes to Quiver are documented in this file.
 
-## [0.1.0] - 2026-10-12
+## [0.2.0] - 2026-10-12
+
+Initial public release to crates.io. Includes all bug fixes from the audit, format v4 header CRC, auto-flush, WAL-size compaction, and improved error handling.
+
+## [0.1.0] - 2026-08-24
 
 ### Added
 
