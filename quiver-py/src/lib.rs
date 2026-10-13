@@ -6,7 +6,7 @@ use pyo3::{
     prelude::*,
     types::{PyBool, PyDict, PyList, PyType},
 };
-use quiver_core::{
+use quiver_vector_rs::{
     distance::Metric,
     index::hnsw::{HnswConfig, HnswIndex},
     index::ivfpq::{IvfPqConfig, IvfPqIndex},
