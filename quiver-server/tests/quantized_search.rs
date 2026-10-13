@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quiver_core::{
+use quiver_vector_rs::{
     distance::Metric,
     index::ivfpq::{IvfPqConfig, IvfPqIndex},
     index::sq8::Sq8Index,

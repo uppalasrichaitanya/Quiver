@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     routing::{delete, get, post, put},
 };
-use quiver_core::{
+use quiver_vector_rs::{
     distance::Metric,
     index::hnsw::{HnswConfig, HnswIndex},
     index::ivfpq::IvfPqIndex,
@@ -341,7 +341,7 @@ fn run_search(
     k: usize,
     ef_search: usize,
     filter: Option<&Filter>,
-) -> Result<Vec<SearchHit>, quiver_core::error::QuiverError> {
+) -> Result<Vec<SearchHit>, quiver_vector_rs::error::QuiverError> {
     let hits = match filter {
         Some(filter) => index.search_filtered(vector, k, ef_search, filter)?,
         None => index.search(vector, k, ef_search)?,
@@ -503,16 +503,16 @@ async fn search_ivfpq(
 /// Map a core error to an HTTP status: client mistakes (bad dimension, empty
 /// search target, missing ID) are 4xx; storage corruption and I/O failures are
 /// 5xx so clients and alerts don't misclassify server-side faults.
-fn api_error(error: quiver_core::error::QuiverError) -> (StatusCode, Json<ErrorResponse>) {
+fn api_error(error: quiver_vector_rs::error::QuiverError) -> (StatusCode, Json<ErrorResponse>) {
     let status = match &error {
-        quiver_core::error::QuiverError::DimensionMismatch { .. }
-        | quiver_core::error::QuiverError::InvalidInput(_)
-        | quiver_core::error::QuiverError::EmptyIndex => StatusCode::BAD_REQUEST,
-        quiver_core::error::QuiverError::NotFound(_) => StatusCode::NOT_FOUND,
-        quiver_core::error::QuiverError::InvalidFormat(_)
-        | quiver_core::error::QuiverError::Io(_)
-        | quiver_core::error::QuiverError::WalChecksumMismatch { .. }
-        | quiver_core::error::QuiverError::UnsupportedMetric(_) => {
+        quiver_vector_rs::error::QuiverError::DimensionMismatch { .. }
+        | quiver_vector_rs::error::QuiverError::InvalidInput(_)
+        | quiver_vector_rs::error::QuiverError::EmptyIndex => StatusCode::BAD_REQUEST,
+        quiver_vector_rs::error::QuiverError::NotFound(_) => StatusCode::NOT_FOUND,
+        quiver_vector_rs::error::QuiverError::InvalidFormat(_)
+        | quiver_vector_rs::error::QuiverError::Io(_)
+        | quiver_vector_rs::error::QuiverError::WalChecksumMismatch { .. }
+        | quiver_vector_rs::error::QuiverError::UnsupportedMetric(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
