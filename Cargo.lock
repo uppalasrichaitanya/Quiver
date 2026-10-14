@@ -757,8 +757,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-core"
-version = "0.1.0"
+name = "quiver-vector-py"
+version = "0.2.0"
+dependencies = [
+ "pyo3",
+ "quiver-vector-rs 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_json",
+]
+
+[[package]]
+name = "quiver-vector-rs"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -773,20 +782,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-py"
-version = "0.1.0"
+name = "quiver-vector-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff75cd2600c5cc3fff732f1bba71ab8975f8cd4fbb400a0611ef128c7ff70a8c"
 dependencies = [
- "pyo3",
- "quiver-core",
+ "byteorder",
+ "crc32fast",
+ "memmap2",
+ "rand",
+ "serde",
  "serde_json",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
-name = "quiver-server"
-version = "0.1.0"
+name = "quiver-vector-server"
+version = "0.2.0"
 dependencies = [
  "axum",
- "quiver-core",
+ "quiver-vector-rs 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "tempfile",

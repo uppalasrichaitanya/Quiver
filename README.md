@@ -25,6 +25,26 @@ benchmark number below links to raw JSON, including the ones where Quiver loses.
 | **Filtered search** | `Eq` / `And` / `Or` / `In` / `Range` predicates over durable, mutable metadata; exact posting-list scan for selective filters, filter-aware graph traversal otherwise |
 | **Hardening** | Bounds-checked parsers, a libFuzzer target run in CI, NaN/overflow-safe distance kernels, input limits on every public endpoint |
 
+## Installation
+
+Published on crates.io:
+
+```toml
+[dependencies]
+quiver-vector-rs = "0.2"         # Core library
+quiver-vector-server = "0.2"     # HTTP server (binary)
+quiver-vector-py = "0.2"         # Python bindings (via PyO3)
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/uppalasrichaitanya/Quiver
+cd Quiver
+cargo build --release -p quiver-server
+./target/release/quiver-server &  # Listens on 127.0.0.1:8080
+```
+
 ## Quick start
 
 ```bash
@@ -67,15 +87,18 @@ host and harness for every engine. Full methodology, sweeps, and raw JSON:
 | **Quiver HNSW** | M=32, efC=200, ef=100 | **0.9961** | 2,680 | 1,145 s |
 | FAISS HNSW | M=32, efC=200, ef=100 | 0.9922 | 2,336 | 560 s |
 | hnswlib | M=32, efC=200, ef=100 | 0.9920 | 2,832 | 566 s |
+| **Quiver HNSW + metadata** | M=32, efC=200, ef=100, 1% selectivity | **1.0000** | 441 | 1,880 s |
+| **Quiver HNSW + metadata** | M=32, efC=200, ef=100, 10% selectivity | 0.9838 | 769 | — |
+| **Quiver HNSW + metadata** | M=32, efC=200, ef=100, 50% selectivity | 0.9940 | 206 | — |
 | **Quiver IVF-PQ** + rerank | nlist=1024, m=32, nprobe=64 | 0.9952 | 1,058 | 95 s |
 | **Quiver SQ8** flat | exhaustive | 0.9889 | 15 | — |
 
 The honest gap: **build is ~2x slower** than FAISS/hnswlib, because Quiver
 fsyncs a WAL during the build while they build in memory and serialize once.
 
-Filtered search on the same corpus (graph traversal path, ef=100): ~2,124 QPS
-at 50% selectivity and ~195 QPS at 1%, recall ≥ 0.9837 throughout. Selective
-`Eq` filters (≤ 32,768 matches) take an exact scan with recall 1.0.
+Metadata filtering scales with selectivity: selective `Eq` filters (≤ 32,768
+matches) take an exact scan with recall 1.0, while graph traversal on broader
+filters (e.g., 10%+ selectivity) maintains high recall with practical throughput.
 
 ## HTTP API
 
@@ -143,7 +166,7 @@ cross-validated against a committed numpy reference of the same pipeline.
   and no filtered search; IVF-PQ is L2-only.
 - **Filtered traversal worst case.** A non-`Eq` filter that matches fewer than
   `k` vectors explores the whole connected graph.
-- **Not released** to crates.io or PyPI yet.
+- **Python bindings require Python ≤ 3.13** (or `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` for 3.14+) until PyO3 updates.
 
 ## Development
 
